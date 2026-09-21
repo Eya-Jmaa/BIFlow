@@ -1,5 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -19,7 +20,7 @@ class Settings(BaseSettings):
 
     api_host: str = "0.0.0.0"
     api_port: int = 8000
-    api_cors_origins: str = "http://localhost:3000"
+    api_cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
 
     database_url: str = "postgresql+psycopg://biflow:change-me-in-production@localhost:5432/biflow"
     analytics_database_url: str | None = None
@@ -79,6 +80,43 @@ class Settings(BaseSettings):
         if provider in {"openai", "local"}:
             return bool(self.openai_api_key)
         return False
+
+    @property
+    def llm_status(self) -> dict[str, Any]:
+        """Why the LLM is or is not active.
+
+        A misconfiguration here is invisible otherwise: every agent's
+        ``interpret_*`` call simply returns ``None`` and the run completes with
+        deterministic results only. That is a safe outcome, but a user who set
+        a key deserves to be told it is not being used.
+        """
+        provider = self.llm_provider.lower()
+        keys = {
+            "openai": bool(self.openai_api_key),
+            "groq": bool(self.groq_api_key),
+            "local": bool(self.openai_api_key),
+        }
+        if not self.llm_enabled:
+            return {"active": False, "provider": provider, "reason": "LLM_ENABLED is false"}
+        if provider not in keys:
+            return {
+                "active": False,
+                "provider": provider,
+                "reason": f"Unknown LLM_PROVIDER {provider!r}; expected openai, groq or local",
+            }
+        if keys[provider]:
+            return {"active": True, "provider": provider, "model": self.llm_model, "reason": None}
+
+        available = [name for name, present in keys.items() if present and name != "local"]
+        hint = (
+            f"LLM_PROVIDER is {provider!r} but its API key is empty. "
+            + (
+                f"A key is set for {' and '.join(available)}; set LLM_PROVIDER={available[0]} to use it."
+                if available
+                else "Set the matching API key, or LLM_ENABLED=false to silence this."
+            )
+        )
+        return {"active": False, "provider": provider, "reason": hint}
 
 
 @lru_cache

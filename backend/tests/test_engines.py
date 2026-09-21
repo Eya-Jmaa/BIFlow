@@ -110,3 +110,25 @@ def test_second_schema_is_dataset_agnostic():
     con = duckdb.connect()
     con.register("invoices", retail.to_arrow())
     assert con.execute(compiled.sql).fetchone()[0] == 8
+
+
+def test_analytical_store_reads_parquet(tmp_path: Path):
+    from app.data.store import AnalyticalStore
+
+    frame = pl.DataFrame({"amount": [1.0, 2.0, 3.0]})
+    frame.write_parquet(tmp_path / "orders.parquet")
+    store = AnalyticalStore(tmp_path)
+    result = store.query('SELECT SUM("orders"."amount") AS value FROM "orders"')
+    assert float(result[0, 0]) == 6.0
+    store.close()
+
+
+def test_csv_adapter_reads_latin1(tmp_path: Path):
+    from app.data.adapters.csv import CSVAdapter
+
+    path = tmp_path / "data.csv"
+    path.write_bytes("city,amount\nSão Paulo,10\n".encode("latin-1"))
+    frame = CSVAdapter(path).load()
+    assert frame.height == 1
+    assert "city" in frame.columns
+    assert frame["amount"].to_list()[0] == 10

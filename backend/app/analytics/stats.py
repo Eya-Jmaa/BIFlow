@@ -59,6 +59,33 @@ def linear_trend(values: list[float]) -> dict[str, Any]:
     return {"slope": slope, "direction": direction, "r2": r2, "intercept": float(model.intercept_)}
 
 
+def seasonality(series: list[dict[str, Any]], min_points: int = 6) -> dict[str, Any] | None:
+    """Locate the strongest and weakest periods in a KPI series.
+
+    Deliberately descriptive rather than a decomposition: with a dozen monthly
+    points there is not enough signal to fit a seasonal model, but naming the
+    peak and trough and the spread between them is defensible and useful.
+    """
+    points = [(p.get("period"), float(p["value"])) for p in series if p.get("value") is not None]
+    if len(points) < min_points:
+        return None
+    peak = max(points, key=lambda item: item[1])
+    trough = min(points, key=lambda item: item[1])
+    if peak[1] == trough[1]:
+        return None
+    base = abs(trough[1]) if trough[1] else abs(peak[1])
+    amplitude_pct = ((peak[1] - trough[1]) / base * 100) if base else 0.0
+    return {
+        "peak_period": str(peak[0]),
+        "peak_value": peak[1],
+        "trough_period": str(trough[0]),
+        "trough_value": trough[1],
+        "amplitude_pct": float(amplitude_pct),
+        "periods": len(points),
+        "method": "peak/trough over the observed series",
+    }
+
+
 def period_change(current: float | None, previous: float | None) -> dict[str, Any]:
     if current is None or previous is None:
         return {"change": None, "change_pct": None}

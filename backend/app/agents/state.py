@@ -15,6 +15,8 @@ class PipelineState(TypedDict, total=False):
     transformations: list[dict[str, Any]]
     joins: list[dict[str, Any]]
     semantic_model: dict[str, Any]
+    roles: dict[str, str]
+    summaries: dict[str, Any]
     kpis: list[dict[str, Any]]
     kpi_results: list[dict[str, Any]]
     analysis: dict[str, Any]

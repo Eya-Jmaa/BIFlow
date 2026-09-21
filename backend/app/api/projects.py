@@ -74,7 +74,11 @@ async def upload_dataset(
     dest.write_bytes(content)
     checksum = hashlib.sha256(content).hexdigest()
     adapter = adapter_for_file(dest, name=Path(filename).stem)
-    meta = adapter.metadata()
+    try:
+        meta = adapter.metadata()
+    except Exception as exc:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=f"Could not read dataset: {exc}") from exc
     table_name = Path(filename).stem.replace("-", "_").replace(" ", "_")
     dataset = Dataset(
         id=dataset_id,

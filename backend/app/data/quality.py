@@ -6,6 +6,7 @@ import polars as pl
 from pydantic import BaseModel, Field
 
 from app.data.profiler import TableProfile
+from app.data.schema_infer import SchemaInference
 
 
 class QualityIssue(BaseModel):
@@ -34,9 +35,11 @@ def assess_quality(
     frame: pl.DataFrame,
     profile: TableProfile,
     join_issues: list[QualityIssue] | None = None,
+    inference: SchemaInference | None = None,
 ) -> QualityScorecard:
     issues: list[QualityIssue] = list(join_issues or [])
     rows = max(frame.height, 1)
+    issues.extend(_type_inference_issues(profile.name, inference))
 
     missing_cells = sum(c.null_count for c in profile.columns)
     total_cells = rows * max(profile.column_count, 1)
@@ -119,6 +122,31 @@ def assess_quality(
                         recommended_action="Investigate negative monetary values before aggregating revenue.",
                     )
                 )
+        # Negative quantities are how almost every retail extract encodes a
+        # return. Summing straight through them nets refunds against sales
+        # without saying so, which is why they are reported here rather than
+        # quietly cleaned away.
+        if column.logical_type == "quantity" and series.dtype.is_numeric():
+            negatives = int((series < 0).sum())
+            if negatives:
+                issues.append(
+                    QualityIssue(
+                        severity="medium",
+                        issue_type="returns_present",
+                        table_name=profile.name,
+                        column_name=column.name,
+                        rows_affected=negatives,
+                        detection_method="negative quantity count",
+                        recommended_action=(
+                            "Treat these as returns. Report gross and net separately rather than "
+                            "summing the column as if every line were a sale."
+                        ),
+                        evidence={
+                            "negative_rows": negatives,
+                            "share": round(negatives / rows, 6),
+                        },
+                    )
+                )
         if column.stats.get("outlier_count_iqr"):
             count = int(column.stats["outlier_count_iqr"])
             issues.append(
@@ -151,6 +179,72 @@ def assess_quality(
         issues=issues,
         table_name=profile.name,
     )
+
+
+def _type_inference_issues(
+    table_name: str, inference: SchemaInference | None
+) -> list[QualityIssue]:
+    """Surface what the loader could not type, and what typing cost.
+
+    A date column that only 96% parses is a real data problem, and the run
+    should say so rather than let the missing 4% look like absent records.
+    """
+    if inference is None:
+        return []
+    issues: list[QualityIssue] = []
+    for column in inference.columns:
+        if column.action == "parse_datetime" and (column.parse_rate or 1.0) < 1.0:
+            issues.append(
+                QualityIssue(
+                    severity="high" if (column.parse_rate or 1) < 0.99 else "low",
+                    issue_type="unparsed_dates",
+                    table_name=table_name,
+                    column_name=column.column,
+                    rows_affected=0,
+                    detection_method=f"date format inference ({column.format})",
+                    recommended_action=(
+                        "Check the source for mixed date formats. Unparsed values are null and "
+                        "are excluded from every time series."
+                    ),
+                    evidence={
+                        "format": column.format,
+                        "parse_rate": column.parse_rate,
+                        "rejected_candidates": column.rejected,
+                    },
+                )
+            )
+        if column.warnings and column.action == "keep" and column.parse_rate:
+            issues.append(
+                QualityIssue(
+                    severity="low",
+                    issue_type="ambiguous_type",
+                    table_name=table_name,
+                    column_name=column.column,
+                    rows_affected=0,
+                    detection_method="schema inference",
+                    recommended_action="; ".join(column.warnings),
+                    evidence={"parse_rate": column.parse_rate, "reason": column.reason},
+                )
+            )
+        if column.action == "parse_datetime" and any(
+            "Ambiguous date order" in warning for warning in column.warnings
+        ):
+            issues.append(
+                QualityIssue(
+                    severity="high",
+                    issue_type="ambiguous_date_order",
+                    table_name=table_name,
+                    column_name=column.column,
+                    rows_affected=0,
+                    detection_method="day/month component analysis",
+                    recommended_action=(
+                        "Confirm the source's date convention. Every value fits both orderings, "
+                        "so the chosen one cannot be proven from the data."
+                    ),
+                    evidence={"format": column.format, "rejected_candidates": column.rejected},
+                )
+            )
+    return issues
 
 
 def referential_issues(tables: dict[str, pl.DataFrame], joins) -> list[QualityIssue]:

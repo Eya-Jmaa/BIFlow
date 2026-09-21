@@ -44,6 +44,17 @@ class DatasetAdapter(ABC):
     def schema(self) -> list[SchemaField]:
         raise NotImplementedError
 
+    def load_with_inference(self, n_rows: int | None = None):
+        """Load and report how each column's type was decided.
+
+        Sources that already carry a schema (Parquet, Postgres) mostly report
+        ``keep``; text sources resolve dates and numbers from scored evidence.
+        Adapters that read typed formats inherit this; CSV overrides it.
+        """
+        from app.data.schema_infer import infer_and_apply
+
+        return infer_and_apply(self.load(n_rows=n_rows), self.name)
+
     def sample(self, n: int = 20) -> pl.DataFrame:
         return self.load(n_rows=n)
 

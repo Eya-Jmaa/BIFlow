@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import duckdb
@@ -7,6 +8,13 @@ import polars as pl
 
 from app.config import get_settings
 from app.security.sql import validate_readonly_sql
+
+
+def _ident(name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_]", "_", name or "")
+    if not cleaned or cleaned[0].isdigit():
+        cleaned = f"t_{cleaned}"
+    return cleaned
 
 
 class AnalyticalStore:
@@ -23,18 +31,25 @@ class AnalyticalStore:
         if not self.parquet_dir.exists():
             return
         for path in sorted(self.parquet_dir.glob("*.parquet")):
-            table = path.stem
+            table = _ident(path.stem)
+            escaped = str(path.resolve()).replace("\\", "/").replace("'", "''")
+            # DuckDB rejects prepared parameters in CREATE VIEW.
             self.con.execute(
-                f'CREATE OR REPLACE VIEW "{table}" AS SELECT * FROM read_parquet(?)',
-                [str(path)],
+                f'CREATE OR REPLACE VIEW "{table}" AS SELECT * FROM read_parquet(\'{escaped}\')'
             )
             self.tables.append(table)
 
     def register_frames(self, tables: dict[str, pl.DataFrame]) -> None:
         for name, frame in tables.items():
-            self.con.register(name, frame.to_arrow())
-            if name not in self.tables:
-                self.tables.append(name)
+            ident = _ident(name)
+            self.con.execute(f'DROP VIEW IF EXISTS "{ident}"')
+            try:
+                self.con.unregister(ident)
+            except Exception:
+                pass
+            self.con.register(ident, frame.to_arrow())
+            if ident not in self.tables:
+                self.tables.append(ident)
 
     def query(self, sql: str) -> pl.DataFrame:
         safe_sql = validate_readonly_sql(sql)

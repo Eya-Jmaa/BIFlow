@@ -119,8 +119,21 @@ export type Widget = {
     value?: number | null;
     previous_value?: number | null;
     change_pct?: number | null;
-    series?: { period: string; value: number | null }[];
+    series?: { period: string; value: number | null; partial?: boolean }[];
     breakdown?: { dimension: string; value: number | null }[];
+    unit?: string | null;
+    format?: { style?: "currency" | "percent" | "integer" | "decimal"; decimals?: number };
+    rows?: { name: string; value: number | null; unit: string | null; formula: string }[];
+    anomalies?: {
+      metric: string;
+      anomalies?: {
+        value: number;
+        method: string;
+        zscore?: number;
+        period?: string | null;
+        unit?: string | null;
+      }[];
+    }[];
   };
   explanation: string | null;
 };
@@ -134,6 +147,57 @@ export type Dashboard = {
   widgets: Widget[];
 };
 
+
+export type DashboardFilter = {
+  column: string;
+  op: "eq" | "ne" | "in" | "not_in" | "gt" | "gte" | "lt" | "lte" | "between" | "contains" | "is_null" | "not_null";
+  values: (string | number)[];
+};
+
+export type FilterDimension = {
+  name: string;
+  label: string;
+  table: string;
+  column: string;
+  type: string;
+  logical_type: string | null;
+  values?: string[];
+  min?: string | null;
+  max?: string | null;
+  grains?: string[];
+};
+
+export type FilterOptions = {
+  run_id: string;
+  dimensions: FilterDimension[];
+  kpis: {
+    slug: string;
+    name: string;
+    unit: string | null;
+    additivity: "additive" | "semi_additive" | "non_additive";
+    tables: string[];
+    format: { style?: string; decimals?: number };
+  }[];
+};
+
+export type QueryResult = {
+  kpi: string;
+  unit: string | null;
+  rows: { dimension?: string; value: number | null }[];
+  sql: string;
+  filters_applied: string[];
+  additivity: string;
+  truncated: boolean;
+};
+
+export type QueryRequest = {
+  kpi_slug: string;
+  dimension?: string | null;
+  grain?: string | null;
+  filters?: DashboardFilter[];
+  limit?: number;
+};
+
 export const api = {
   health: () => request<{ status: string }>("/health"),
   projects: () => request<Project[]>("/api/projects"),
@@ -145,8 +209,22 @@ export const api = {
   uploadDataset: async (id: string, file: File) => {
     const data = new FormData();
     data.append("file", file);
-    const response = await fetch(`${API_URL}/api/projects/${id}/datasets`, { method: "POST", body: data });
-    if (!response.ok) throw new Error(await response.text());
+    let response: Response;
+    try {
+      response = await fetch(`${API_URL}/api/projects/${id}/datasets`, { method: "POST", body: data });
+    } catch {
+      throw new Error("Cannot reach the API. Confirm the backend is running at http://localhost:8000.");
+    }
+    if (!response.ok) {
+      let detail = `Upload failed (${response.status})`;
+      try {
+        const payload = await response.json();
+        detail = payload.detail || JSON.stringify(payload);
+      } catch {
+        detail = await response.text();
+      }
+      throw new Error(detail);
+    }
     return response.json() as Promise<Dataset>;
   },
   runPipeline: (id: string) => request<PipelineRun>(`/api/projects/${id}/pipeline/run`, { method: "POST" }),
@@ -167,6 +245,9 @@ export const api = {
   lineage: (id: string) => request<unknown>(`/api/projects/${id}/lineage`),
   agentRuns: (id: string) => request<unknown[]>(`/api/projects/${id}/agent-runs`),
   evaluation: (id: string) => request<unknown[]>(`/api/projects/${id}/evaluation`),
+  filterOptions: (id: string) => request<FilterOptions>(`/api/projects/${id}/filter-options`),
+  queryKpi: (id: string, body: QueryRequest) =>
+    request<QueryResult>(`/api/projects/${id}/query`, { method: "POST", body: JSON.stringify(body) }),
   exportUrl: (id: string, format: "json" | "csv" | "xlsx" | "pdf") => `${API_URL}/api/projects/${id}/export/${format}`,
   streamUrl: (runId: string) => `${API_URL}/api/pipeline-runs/${runId}/stream`,
 };

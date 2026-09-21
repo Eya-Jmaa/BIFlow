@@ -1,10 +1,27 @@
+"""Agent implementations for the BI pipeline.
+
+Each agent is a node function over :class:`~app.agents.state.PipelineState`.
+They are wired together by :mod:`app.agents.graph_def`, which owns the control
+flow -- ordering, conditional routing, retry budgets and the auditor's feedback
+edges. This module owns the work; it does not decide what runs next.
+
+Two properties matter throughout:
+
+* **Every node is idempotent.** The auditor can send the run back to the
+  quality or semantic agent, so a node must be able to execute twice within a
+  run. Each one deletes its own artefacts for the run before writing new ones.
+* **Numbers come from Polars, DuckDB and validated SQL.** The LLM, when
+  configured, interprets evidence and may propose additional KPIs, but every
+  value shown to a user was computed deterministically and can be traced to the
+  SQL that produced it.
+"""
+
 from __future__ import annotations
 
-import hashlib
-import json
 import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from uuid import UUID
 
 import polars as pl
@@ -19,14 +36,32 @@ from app.agents.llm_support import (
     interpret_quality,
     interpret_semantic,
 )
-from app.analytics.kpi_engine import FormulaError, compile_formula
-from app.analytics.stats import concentration, correlation_matrix, iqr_outliers, linear_trend, pareto, period_change, zscore_anomalies
+from app.agents.state import PipelineState
+from app.analytics.kpi_catalog import InstantiatedKPI, generic_fallback, instantiate_catalog
+from app.analytics.kpi_engine import (
+    CompiledKPI,
+    FormulaError,
+    compile_formula,
+    describe_grammar,
+    quote_ident,
+)
+from app.analytics.roles import SemanticBinding, bind_roles
+from app.analytics.stats import (
+    concentration,
+    correlation_matrix,
+    iqr_outliers,
+    linear_trend,
+    pareto,
+    seasonality,
+    zscore_anomalies,
+)
 from app.config import get_settings
 from app.data.etl import execute_plan, plan_from_issues
 from app.data.joins import discover_joins
 from app.data.pii import detect_pii
 from app.data.profiler import TableProfile, profile_frame
 from app.data.quality import QualityIssue, assess_quality, referential_issues
+from app.data.schema_infer import SchemaInference
 from app.data.store import AnalyticalStore
 from app.domains.profiles import get_domain, infer_domain
 from app.logging import get_logger
@@ -66,23 +101,40 @@ STEP_SEQUENCE = [
     ("auditor", "BI Auditor / XAI"),
 ]
 
+# The auditor sends the run back when results are not defensible. These are the
+# thresholds it judges against.
+MIN_ACCEPTABLE_QUALITY = 55.0
+MIN_KPI_SUCCESS_RATIO = 0.6
+
 
 def _slug(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")[:80]
 
 
-def load_project_tables(db: Session, project_id: UUID) -> dict[str, tuple[Dataset, pl.DataFrame, Path]]:
+def _as_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return number
+
+
+def load_project_tables(db: Session, project_id: UUID) -> dict[str, tuple[Dataset, pl.DataFrame, Path, SchemaInference]]:
     from app.data.adapters import adapter_for_file
 
     datasets = db.query(Dataset).filter(Dataset.project_id == project_id, Dataset.layer == "raw").all()
-    loaded: dict[str, tuple[Dataset, pl.DataFrame, Path]] = {}
+    loaded: dict[str, tuple[Dataset, pl.DataFrame, Path, SchemaInference]] = {}
     for dataset in datasets:
         file = db.query(DatasetFile).filter(DatasetFile.dataset_id == dataset.id).first()
         if not file:
             continue
         adapter = adapter_for_file(file.storage_path, name=dataset.table_name)
-        frame = adapter.load()
-        loaded[dataset.table_name] = (dataset, frame, Path(file.storage_path))
+        frame, inference = adapter.load_with_inference()
+        loaded[dataset.table_name] = (dataset, frame, Path(file.storage_path), inference)
     return loaded
 
 
@@ -96,6 +148,13 @@ def persist_parquet(run_id: UUID, tables: dict[str, pl.DataFrame]) -> Path:
 
 
 class PipelineExecutor:
+    """Holds the run's working data and implements each agent.
+
+    The heavy objects -- DataFrames, profiles, the DuckDB store -- live here
+    rather than in the graph state, which carries only summaries so it stays
+    small and serialisable.
+    """
+
     def __init__(self, db: Session, project_id: UUID, run_id: UUID):
         from app.models import PipelineRun, Project
 
@@ -108,102 +167,114 @@ class PipelineExecutor:
         self.raw_tables: dict[str, pl.DataFrame] = {}
         self.dataset_map: dict[str, Dataset] = {}
         self.profiles: dict[str, TableProfile] = {}
-        self.joins = []
+        self.inferences: dict[str, SchemaInference] = {}
+        self.joins: list[Any] = []
+        self.binding: SemanticBinding | None = None
         self.parquet_dir: Path | None = None
+        self.attempts: dict[str, int] = {}
 
-    def execute(self) -> None:
-        from datetime import datetime, timezone
+    # ------------------------------------------------------------------
+    # Schema exposed to the formula compiler, so an invented column is
+    # rejected at compile time rather than becoming a wrong number.
+    # ------------------------------------------------------------------
+    @property
+    def schema(self) -> dict[str, list[str]]:
+        return {name: list(frame.columns) for name, frame in self.tables.items()}
 
-        self.run.status = "running"
-        self.run.started_at = datetime.now(timezone.utc)
-        self.db.commit()
-        publish_event(str(self.run_id), "pipeline.started", {"project_id": str(self.project_id)})
-        try:
-            loaded = load_project_tables(self.db, self.project_id)
-            if not loaded:
-                raise RuntimeError("No datasets uploaded for this project")
-            for name, (dataset, frame, _) in loaded.items():
-                self.tables[name] = frame
-                self.raw_tables[name] = frame
-                self.dataset_map[name] = dataset
-            self._orchestrator()
-            self._profiler()
-            self._quality()
-            self._semantic()
-            self._analyst()
-            self._dashboard()
-            self._auditor()
-            self._evaluate()
-            self.run.status = "completed"
-            self.run.completed_at = datetime.now(timezone.utc)
-            self.run.current_step = "completed"
-            self.db.commit()
-            publish_event(str(self.run_id), "pipeline.completed", {"status": "completed"})
-        except Exception as exc:
-            logger.exception("pipeline_failed", run_id=str(self.run_id), error=str(exc))
-            self.run.status = "failed"
-            self.run.error = str(exc)
-            self.run.completed_at = datetime.now(timezone.utc)
-            self.db.commit()
-            publish_event(str(self.run_id), "pipeline.failed", {"error": str(exc)})
-            raise
+    def load(self) -> None:
+        loaded = load_project_tables(self.db, self.project_id)
+        if not loaded:
+            raise RuntimeError("No datasets uploaded for this project")
+        for name, (dataset, frame, _, inference) in loaded.items():
+            self.tables[name] = frame
+            self.raw_tables[name] = frame
+            self.dataset_map[name] = dataset
+            self.inferences[name] = inference
 
-    def _step(self, name: str, fn):
-        from datetime import datetime, timezone
-
+    # ------------------------------------------------------------------
+    # Step bookkeeping
+    # ------------------------------------------------------------------
+    def _begin_step(self, name: str):
         from app.models import AgentRun, PipelineStep
 
+        attempt = self.attempts.get(name, 0) + 1
+        self.attempts[name] = attempt
         step = (
             self.db.query(PipelineStep)
             .filter(PipelineStep.run_id == self.run_id, PipelineStep.name == name)
-            .one()
+            .one_or_none()
         )
-        step.status = "running"
-        step.started_at = datetime.now(timezone.utc)
+        started = datetime.now(timezone.utc)
+        if step is not None:
+            step.status = "running"
+            step.started_at = started
+            step.error = None
         self.run.current_step = name
         self.db.commit()
-        publish_event(str(self.run_id), "agent.started", {"agent": name})
+        publish_event(str(self.run_id), "agent.started", {"agent": name, "attempt": attempt})
         agent = AgentRun(
             run_id=self.run_id,
-            step_id=step.id,
+            step_id=step.id if step else None,
             agent_name=name,
             status="running",
-            started_at=step.started_at,
+            started_at=started,
+            retry_count=attempt - 1,
         )
         self.db.add(agent)
         self.db.commit()
+        return step, agent, started
+
+    def run_step(self, name: str, fn: Callable[[], dict[str, Any]], state: PipelineState) -> dict[str, Any]:
+        """Execute one agent, recording timing, tokens and failures.
+
+        A failure is recorded and returned as state rather than raised, so the
+        graph can route to the auditor and still produce a partial, clearly
+        labelled result instead of losing the whole run.
+        """
+        step, agent, started = self._begin_step(name)
         try:
-            summary = fn()
+            summary = fn() or {}
             ended = datetime.now(timezone.utc)
-            step.status = "completed"
-            step.completed_at = ended
-            step.duration_ms = int((ended - step.started_at).total_seconds() * 1000)
-            step.output_summary = summary or {}
+            duration = int((ended - started).total_seconds() * 1000)
+            if step is not None:
+                step.status = "completed"
+                step.completed_at = ended
+                step.duration_ms = duration
+                step.output_summary = summary
             agent.status = "completed"
             agent.completed_at = ended
-            agent.latency_ms = step.duration_ms
-            agent.output_summary = summary or {}
-            llm_meta = (summary or {}).get("llm") or {}
+            agent.latency_ms = duration
+            agent.output_summary = summary
+            llm_meta = summary.get("llm") or {}
             agent.llm_model = llm_meta.get("model")
             agent.prompt_tokens = llm_meta.get("prompt_tokens")
             agent.completion_tokens = llm_meta.get("completion_tokens")
             self.db.commit()
             publish_event(str(self.run_id), "agent.completed", {"agent": name, "summary": summary})
             return summary
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - recorded, then routed
+            self.db.rollback()
+            logger.exception("agent_failed", agent=name, run_id=str(self.run_id), error=str(exc))
             ended = datetime.now(timezone.utc)
-            step.status = "failed"
-            step.error = str(exc)
-            step.completed_at = ended
+            if step is not None:
+                step.status = "failed"
+                step.error = str(exc)
+                step.completed_at = ended
             agent.status = "failed"
             agent.error = str(exc)
             agent.completed_at = ended
             self.db.commit()
             publish_event(str(self.run_id), "agent.failed", {"agent": name, "error": str(exc)})
-            raise
+            errors = list(state.get("errors") or [])
+            errors.append(f"{name}: {exc}")
+            state["errors"] = errors
+            return {"error": str(exc)}
 
-    def _orchestrator(self):
-        def run():
+    # ------------------------------------------------------------------
+    # Agents
+    # ------------------------------------------------------------------
+    def orchestrator(self, state: PipelineState) -> PipelineState:
+        def run() -> dict[str, Any]:
             columns = [c for frame in self.tables.values() for c in frame.columns]
             domain = infer_domain(self.project.business_objective, columns)
             self.project.domain = domain
@@ -212,12 +283,19 @@ class PipelineExecutor:
                     "objective": self.project.business_objective,
                     "tables": {name: list(frame.columns) for name, frame in self.tables.items()},
                     "row_counts": {name: frame.height for name, frame in self.tables.items()},
+                    "schema_inference": {
+                        name: [c.model_dump() for c in inference.columns]
+                        for name, inference in self.inferences.items()
+                    },
                 }
             )
             self.run.configuration = {
                 "domain": domain,
                 "table_count": len(self.tables),
                 "plan": (interpretation or {}).get("plan_summary"),
+                "risks": (interpretation or {}).get("risks"),
+                "llm_enabled": get_settings().llm_configured,
+                "kpi_grammar": describe_grammar(),
             }
             return {
                 "domain": domain,
@@ -226,14 +304,25 @@ class PipelineExecutor:
                 "llm": (interpretation or {}).get("_llm"),
             }
 
-        return self._step("orchestrator", run)
+        summary = self.run_step("orchestrator", run, state)
+        state["domain"] = summary.get("domain", "general")
+        state["datasets"] = [
+            {"table": name, "rows": frame.height, "columns": frame.width}
+            for name, frame in self.tables.items()
+        ]
+        state["status"] = "orchestrated"
+        return state
 
-    def _profiler(self):
-        def run():
-            all_pii = []
-            compact_profiles = []
+    def profiler(self, state: PipelineState) -> PipelineState:
+        def run() -> dict[str, Any]:
+            self._clear(DataProfile, cascade_columns=True)
+            all_pii: list[dict[str, Any]] = []
+            compact: list[dict[str, Any]] = []
             for name, frame in self.tables.items():
                 profile = profile_frame(frame, name)
+                inference = self.inferences.get(name)
+                if inference is not None:
+                    profile.warnings.extend(inference.warnings)
                 self.profiles[name] = profile
                 pii = detect_pii(frame, name)
                 all_pii.extend(pii)
@@ -252,33 +341,39 @@ class PipelineExecutor:
                 )
                 self.db.add(row)
                 self.db.flush()
-                for col in profile.columns:
+                for column in profile.columns:
+                    decision = inference.by_column(column.name) if inference else None
+                    stats = dict(column.stats)
+                    if decision is not None:
+                        stats["type_inference"] = decision.model_dump()
                     self.db.add(
                         DataProfileColumn(
                             profile_id=row.id,
-                            name=col.name,
-                            inferred_type=col.inferred_type,
-                            logical_type=col.logical_type,
-                            null_count=col.null_count,
-                            null_pct=col.null_pct,
-                            distinct_count=col.distinct_count,
-                            uniqueness_pct=col.uniqueness_pct,
-                            is_candidate_pk=col.is_candidate_pk,
-                            is_candidate_fk=col.is_candidate_fk,
-                            semantic_hint=col.semantic_hint,
-                            stats=col.stats,
-                            warnings=col.warnings,
+                            name=column.name,
+                            inferred_type=column.inferred_type,
+                            logical_type=column.logical_type,
+                            null_count=column.null_count,
+                            null_pct=column.null_pct,
+                            distinct_count=column.distinct_count,
+                            uniqueness_pct=column.uniqueness_pct,
+                            is_candidate_pk=column.is_candidate_pk,
+                            is_candidate_fk=column.is_candidate_fk,
+                            semantic_hint=column.semantic_hint,
+                            stats=stats,
+                            warnings=column.warnings,
                         )
                     )
-                compact_profiles.append(profile.model_dump())
+                compact.append(profile.model_dump())
+
             self.joins = discover_joins(self.tables)
+            self.binding = bind_roles(self.profiles, self.tables)
+
             interpretation = interpret_profiler(
                 {
                     "profiles": [
                         {
                             "name": p["name"],
                             "row_count": p["row_count"],
-                            "column_count": p["column_count"],
                             "quality_score": p["quality_score"],
                             "warnings": p["warnings"],
                             "columns": [
@@ -292,39 +387,55 @@ class PipelineExecutor:
                                 for c in p["columns"]
                             ],
                         }
-                        for p in compact_profiles
+                        for p in compact
                     ],
                     "joins": [j.model_dump() for j in self.joins[:20]],
+                    "roles": {r: b.ref for r, b in self.binding.roles.items()},
+                    "returns_convention": self.binding.returns.model_dump(),
                     "pii": all_pii,
                 }
             )
-            if interpretation:
-                for name, profile_row in [(p["name"], None) for p in compact_profiles]:
-                    rec = (
-                        self.db.query(DataProfile)
-                        .filter(DataProfile.run_id == self.run_id)
-                        .all()
-                    )
-                    for item in rec:
-                        if item.summary is None:
-                            item.summary = interpretation.get("summary")
-                            break
+            if interpretation and interpretation.get("summary"):
+                for record in self.db.query(DataProfile).filter(DataProfile.run_id == self.run_id):
+                    record.summary = interpretation["summary"]
+
             return {
                 "tables": len(self.tables),
                 "rows": sum(p.row_count for p in self.profiles.values()),
                 "joins": len(self.joins),
                 "pii_flags": len(all_pii),
+                "roles_bound": len(self.binding.roles),
+                "returns_detected": self.binding.returns.detected,
                 "llm": (interpretation or {}).get("_llm"),
             }
 
-        return self._step("profiler", run)
+        summary = self.run_step("profiler", run, state)
+        state["profiles"] = [{"table": n, "rows": p.row_count} for n, p in self.profiles.items()]
+        state["joins"] = [j.model_dump() for j in self.joins]
+        if self.binding is not None:
+            state["roles"] = {role: b.ref for role, b in self.binding.roles.items()}
+        state["status"] = "profiled"
+        state.setdefault("summaries", {})["profiler"] = summary
+        return state
 
-    def _quality(self):
-        def run():
-            all_issues: list[QualityIssue] = referential_issues(self.tables, self.joins)
+    def quality(self, state: PipelineState) -> PipelineState:
+        def run() -> dict[str, Any]:
+            self._clear(DataQualityReport, cascade_issues=True)
+            self._clear(Transformation)
+            # Quality always re-derives from the raw tables, so a retry is not
+            # applied on top of an already-cleaned frame.
+            self.tables = {name: frame.clone() for name, frame in self.raw_tables.items()}
+            self.profiles = {name: profile_frame(frame, name) for name, frame in self.tables.items()}
+
+            join_issues = referential_issues(self.tables, self.joins)
             reports = []
             for name, frame in self.tables.items():
-                scorecard = assess_quality(frame, self.profiles[name], join_issues=[i for i in all_issues if i.table_name == name])
+                scorecard = assess_quality(
+                    frame,
+                    self.profiles[name],
+                    join_issues=[i for i in join_issues if i.table_name == name],
+                    inference=self.inferences.get(name),
+                )
                 reports.append(scorecard)
                 dataset = self.dataset_map[name]
                 report = DataQualityReport(
@@ -360,11 +471,12 @@ class PipelineExecutor:
                         "quality.issue_detected",
                         {"table": issue.table_name, "type": issue.issue_type, "rows": issue.rows_affected},
                     )
-            combined_issues = [issue for report in reports for issue in report.issues]
-            plan = plan_from_issues(combined_issues)
+
+            issues = [issue for report in reports for issue in report.issues]
+            plan = plan_from_issues(issues)
             interpretation = interpret_quality(
                 {
-                    "issues": [i.model_dump() for i in combined_issues[:80]],
+                    "issues": [i.model_dump() for i in issues[:80]],
                     "proposed_plan": plan.model_dump(),
                 }
             )
@@ -386,46 +498,85 @@ class PipelineExecutor:
                         parameters=result.parameters,
                     )
                 )
+            # Profiles and role bindings describe the cleaned layer from here on.
+            self.profiles = {name: profile_frame(frame, name) for name, frame in self.tables.items()}
+            self.binding = bind_roles(self.profiles, self.tables)
             self.parquet_dir = persist_parquet(self.run_id, self.tables)
             overall = round(sum(r.overall for r in reports) / max(len(reports), 1), 2)
             return {
-                "issues": len(combined_issues),
+                "issues": len(issues),
                 "transformations": len(results),
                 "overall_score": overall,
                 "llm": (interpretation or {}).get("_llm"),
             }
 
-        return self._step("quality", run)
+        summary = self.run_step("quality", run, state)
+        state["quality_report"] = {"overall_score": summary.get("overall_score"), "issues": summary.get("issues")}
+        state["transformations"] = [{"count": summary.get("transformations", 0)}]
+        state["status"] = "cleaned"
+        state.setdefault("summaries", {})["quality"] = summary
+        return state
 
-    def _semantic(self):
-        def run():
-            domain = get_domain(self.project.domain or "general")
-            dimensions, measures = self._infer_semantic()
-            kpi_specs = self._heuristic_kpis(measures, dimensions)
-            llm = interpret_semantic(
-                {
-                    "objective": self.project.business_objective,
-                    "domain": domain.model_dump(),
-                    "dimensions": dimensions,
-                    "measures": measures,
-                    "joins": [j.model_dump() for j in self.joins if j.validated][:30],
-                }
+    # ------------------------------------------------------------------
+    def semantic(self, state: PipelineState) -> PipelineState:
+        def run() -> dict[str, Any]:
+            self._clear(KPI, cascade_results=True)
+            self._clear(SemanticModel, cascade_semantic=True)
+
+            retried = int((state.get("retry") or {}).get("semantic", 0)) + int(
+                (state.get("retry") or {}).get("audit_semantic", 0)
             )
-            if llm and isinstance(llm.get("kpis"), list):
-                kpi_specs = self._merge_llm_kpis(kpi_specs, llm["kpis"], measures)
+            domain_profile = get_domain(self.project.domain or "general")
+            dimensions, measures = self._infer_semantic()
+            assert self.binding is not None
+            specs = instantiate_catalog(self.binding, self.project.domain or "general")
+            if not specs:
+                identifiers = [
+                    f"{name}.{column.name}"
+                    for name, profile in self.profiles.items()
+                    for column in profile.columns
+                    if column.is_candidate_pk or column.logical_type == "identifier"
+                ]
+                specs = generic_fallback(measures, identifiers)
+
+            llm_meta = None
+            # On a retry the auditor has already rejected LLM-proposed KPIs, so
+            # the agent falls back to the catalog alone rather than asking again
+            # and risking the same rejection.
+            if retried == 0:
+                llm = interpret_semantic(
+                    {
+                        "objective": self.project.business_objective,
+                        "domain": domain_profile.model_dump(),
+                        "grammar": describe_grammar(),
+                        "roles": {r: b.ref for r, b in self.binding.roles.items()},
+                        "schema": self.schema,
+                        "existing_kpis": [{"name": s.name, "formula": s.formula} for s in specs],
+                        "joins": [j.model_dump() for j in self.joins if j.validated][:30],
+                    }
+                )
+                if llm:
+                    llm_meta = llm.get("_llm")
+                    if isinstance(llm.get("kpis"), list):
+                        specs = self._merge_llm_kpis(specs, llm["kpis"])
+
             model = SemanticModel(
                 run_id=self.run_id,
                 project_id=self.project_id,
-                version=1,
+                version=1 + retried,
                 domain=self.project.domain,
-                summary=f"{len(dimensions)} dimensions, {len(measures)} measures, {len(kpi_specs)} KPIs",
+                summary=(
+                    f"{len(dimensions)} dimensions, {len(measures)} measures, "
+                    f"{len(specs)} KPIs, {len(self.binding.roles)} business roles bound"
+                ),
+                grain=self.binding.ref("order_id"),
             )
             self.db.add(model)
             self.db.flush()
-            for dim in dimensions:
-                self.db.add(Dimension(semantic_model_id=model.id, **dim))
-            for meas in measures:
-                self.db.add(Measure(semantic_model_id=model.id, **meas))
+            for dimension in dimensions:
+                self.db.add(Dimension(semantic_model_id=model.id, **dimension))
+            for measure in measures:
+                self.db.add(Measure(semantic_model_id=model.id, **measure))
             for join in self.joins:
                 if not join.validated:
                     continue
@@ -443,202 +594,339 @@ class PipelineExecutor:
                         extra=join.evidence,
                     )
                 )
+
             store = AnalyticalStore(self.parquet_dir or persist_parquet(self.run_id, self.tables))
             store.register_frames(self.tables)
             join_dicts = [j.model_dump() for j in self.joins if j.validated]
-            computed = 0
-            for spec in kpi_specs:
-                try:
-                    compiled = compile_formula(spec["formula"], join_dicts)
-                    result_frame = store.query(compiled.sql)
-                    value = result_frame[0, 0] if result_frame.height else None
-                    value = float(value) if value is not None else None
-                    kpi = KPI(
-                        run_id=self.run_id,
-                        semantic_model_id=model.id,
-                        name=spec["name"],
-                        slug=_slug(spec["name"]),
-                        description=spec.get("description") or spec["name"],
-                        business_meaning=spec.get("business_meaning") or spec["name"],
-                        formula=spec["formula"],
-                        unit=spec.get("unit"),
-                        dimensions=spec.get("dimensions") or [],
-                        data_sources=compiled.tables,
-                        confidence=spec.get("confidence", 0.7),
-                        validation_status="computed" if value is not None else "failed",
-                        query_sql=compiled.sql,
-                    )
-                    self.db.add(kpi)
-                    self.db.flush()
-                    breakdown = self._breakdown(store, compiled, spec)
-                    series = self._time_series(store, compiled, dimensions)
-                    self.db.add(
-                        KPIResult(
-                            kpi_id=kpi.id,
-                            run_id=self.run_id,
-                            value=value,
-                            query_sql=compiled.sql,
-                            row_count=int(result_frame.height),
-                            breakdown=breakdown,
-                            time_series=series,
-                            status="computed" if value is not None else "failed",
-                            computed_at=self._now(),
-                            previous_value=_previous(series),
-                            change_pct=_change_from_series(series),
-                        )
-                    )
-                    computed += 1
-                    publish_event(str(self.run_id), "kpi.calculated", {"name": kpi.name, "value": value})
-                except (FormulaError, Exception) as exc:
-                    logger.warning("kpi_failed", formula=spec.get("formula"), error=str(exc))
-                    self.db.add(
-                        KPI(
-                            run_id=self.run_id,
-                            semantic_model_id=model.id,
-                            name=spec["name"],
-                            slug=_slug(spec["name"]),
-                            description=spec.get("description") or spec["name"],
-                            business_meaning=spec.get("business_meaning") or spec["name"],
-                            formula=spec["formula"],
-                            unit=spec.get("unit"),
-                            confidence=0.0,
-                            validation_status="invalid_formula",
-                            query_sql=None,
-                        )
-                    )
-            store.close()
-            return {"dimensions": len(dimensions), "measures": len(measures), "kpis_computed": computed, "llm": (llm or {}).get("_llm")}
+            computed = failed = 0
+            try:
+                for spec in specs:
+                    if self._compute_kpi(store, model, spec, join_dicts):
+                        computed += 1
+                    else:
+                        failed += 1
+            finally:
+                store.close()
 
-        return self._step("semantic", run)
+            return {
+                "dimensions": len(dimensions),
+                "measures": len(measures),
+                "kpis_computed": computed,
+                "kpis_failed": failed,
+                "attempt": self.attempts.get("semantic", 1),
+                "llm": llm_meta,
+            }
 
-    def _analyst(self):
-        def run():
+        summary = self.run_step("semantic", run, state)
+        if not summary.get("kpis_computed"):
+            retries = dict(state.get("retry") or {})
+            used = int(retries.get("semantic", 0))
+            if used < get_settings().pipeline_max_retries:
+                retries["semantic"] = used + 1
+                state["retry"] = retries
+        kpis = self.db.query(KPI).filter(KPI.run_id == self.run_id).all()
+        state["kpis"] = [
+            {"name": k.name, "slug": k.slug, "formula": k.formula, "status": k.validation_status}
+            for k in kpis
+        ]
+        state["status"] = "modelled"
+        state.setdefault("summaries", {})["semantic"] = summary
+        return state
+
+    def _compute_kpi(
+        self,
+        store: AnalyticalStore,
+        model: SemanticModel,
+        spec: InstantiatedKPI,
+        joins: list[dict[str, Any]],
+    ) -> bool:
+        try:
+            compiled = compile_formula(spec.formula, joins, schema=self.schema)
+        except FormulaError as exc:
+            logger.warning("kpi_formula_rejected", formula=spec.formula, error=str(exc))
+            self.db.add(
+                KPI(
+                    run_id=self.run_id,
+                    semantic_model_id=model.id,
+                    name=spec.name,
+                    slug=spec.slug or _slug(spec.name),
+                    description=spec.description,
+                    business_meaning=spec.business_meaning,
+                    formula=spec.formula,
+                    unit=spec.unit,
+                    confidence=0.0,
+                    validation_status="invalid_formula",
+                    filters={"error": str(exc), **spec.provenance},
+                    query_sql=None,
+                )
+            )
+            return False
+
+        try:
+            frame = store.query(compiled.sql)
+            value = _as_float(frame[0, 0]) if frame.height else None
+        except Exception as exc:  # noqa: BLE001 - recorded on the KPI itself
+            logger.warning("kpi_execution_failed", formula=spec.formula, error=str(exc))
+            self.db.add(
+                KPI(
+                    run_id=self.run_id,
+                    semantic_model_id=model.id,
+                    name=spec.name,
+                    slug=spec.slug or _slug(spec.name),
+                    description=spec.description,
+                    business_meaning=spec.business_meaning,
+                    formula=spec.formula,
+                    unit=spec.unit,
+                    confidence=0.0,
+                    validation_status="execution_failed",
+                    filters={"error": str(exc), **spec.provenance},
+                    query_sql=compiled.sql,
+                )
+            )
+            return False
+
+        kpi = KPI(
+            run_id=self.run_id,
+            semantic_model_id=model.id,
+            name=spec.name,
+            slug=spec.slug or _slug(spec.name),
+            description=spec.description,
+            business_meaning=spec.business_meaning,
+            formula=spec.formula,
+            unit=spec.unit,
+            dimensions=spec.dimensions,
+            data_sources=compiled.tables,
+            confidence=spec.confidence,
+            filters={**spec.provenance, "additivity": compiled.additivity, "higher_is_better": spec.higher_is_better},
+            validation_status="computed" if value is not None else "null_result",
+            query_sql=compiled.sql,
+        )
+        self.db.add(kpi)
+        self.db.flush()
+
+        series = self._time_series(store, compiled)
+        breakdown = self._breakdown(store, compiled)
+
+        # Compare only complete periods. A trailing part-month against a full
+        # one manufactures a collapse in every single metric.
+        comparable = _complete_points(series)
+        previous = current = change = None
+        if len(comparable) >= 2:
+            previous = _as_float(comparable[-2]["value"])
+            current = _as_float(comparable[-1]["value"])
+            if previous not in (None, 0) and current is not None:
+                change = (current - previous) / previous
+        partial_tail = bool(series) and bool(series[-1].get("partial"))
+
+        self.db.add(
+            KPIResult(
+                kpi_id=kpi.id,
+                run_id=self.run_id,
+                value=value,
+                query_sql=compiled.sql,
+                row_count=1,
+                breakdown=breakdown,
+                time_series=series,
+                filters={
+                    "format": spec.format,
+                    "additivity": compiled.additivity,
+                    "comparison_period": comparable[-1]["period"] if comparable else None,
+                    "baseline_period": comparable[-2]["period"] if len(comparable) >= 2 else None,
+                    "partial_period_excluded": series[-1]["period"] if partial_tail else None,
+                },
+                status="computed" if value is not None else "null_result",
+                computed_at=datetime.now(timezone.utc),
+                previous_value=previous,
+                change_pct=change,
+            )
+        )
+        publish_event(str(self.run_id), "kpi.calculated", {"name": kpi.name, "value": value})
+        return value is not None
+
+    def _time_series(self, store: AnalyticalStore, compiled: CompiledKPI) -> list[dict[str, Any]]:
+        assert self.binding is not None
+        date_ref = self.binding.ref("event_date")
+        if not date_ref:
+            return []
+        table, column = date_ref.split(".", 1)
+        if table not in compiled.tables:
+            return []
+        grain = self._time_grain(table, column)
+        dimension_sql = f"date_trunc('{grain}', {quote_ident(table)}.{quote_ident(column)})"
+        sql = compiled.grouped_sql(dimension_sql, alias="period", order_by="1 ASC")
+        try:
+            frame = store.query(sql)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("time_series_failed", error=str(exc))
+            return []
+
+        last_observation = self._last_observation(table, column)
+        series: list[dict[str, Any]] = []
+        for row in frame.to_dicts():
+            period = row.get("period")
+            if period is None:
+                continue
+            series.append(
+                {
+                    "period": str(period),
+                    "value": _as_float(row["value"]),
+                    # The final bucket is usually cut short by the extract date.
+                    # Flagged, so nothing compares a part-month against a full one.
+                    "partial": _is_partial_period(period, grain, last_observation),
+                }
+            )
+        return series
+
+    def _last_observation(self, table: str, column: str) -> datetime | None:
+        frame = self.tables.get(table)
+        if frame is None or column not in frame.columns:
+            return None
+        value = frame[column].drop_nulls().max()
+        if isinstance(value, datetime):
+            return value
+        try:
+            return datetime.combine(value, datetime.min.time())  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+
+    def _time_grain(self, table: str, column: str) -> str:
+        """Pick a grain that yields a readable number of points."""
+        frame = self.tables.get(table)
+        if frame is None or column not in frame.columns:
+            return "month"
+        series = frame[column].drop_nulls()
+        if series.len() < 2:
+            return "month"
+        try:
+            span_days = (series.max() - series.min()).days  # type: ignore[operator]
+        except Exception:  # noqa: BLE001
+            return "month"
+        if span_days <= 2:
+            return "hour"
+        if span_days <= 62:
+            return "day"
+        if span_days <= 365 * 2:
+            return "month"
+        return "quarter" if span_days <= 365 * 8 else "year"
+
+    def _breakdown(self, store: AnalyticalStore, compiled: CompiledKPI) -> list[dict[str, Any]]:
+        assert self.binding is not None
+        for candidate in self.binding.dimensions:
+            if candidate.evidence.get("logical_type") == "datetime":
+                continue
+            if candidate.table not in compiled.tables:
+                continue
+            dimension_sql = f"{quote_ident(candidate.table)}.{quote_ident(candidate.column)}"
+            sql = compiled.grouped_sql(dimension_sql, alias="dimension", limit=15)
+            try:
+                frame = store.query(sql)
+            except Exception:  # noqa: BLE001
+                continue
+            rows = [
+                {"dimension": str(row["dimension"]), "value": _as_float(row["value"])}
+                for row in frame.to_dicts()
+                if row.get("dimension") is not None
+            ]
+            if rows:
+                return rows
+        return []
+
+    # ------------------------------------------------------------------
+    def analyst(self, state: PipelineState) -> PipelineState:
+        def run() -> dict[str, Any]:
+            self._clear(AnalysisResult)
+            self._clear(Insight)
             kpis = self.db.query(KPI).filter(KPI.run_id == self.run_id).all()
-            evidence_pack = []
+            evidence: list[dict[str, Any]] = []
             insights: list[Insight] = []
+
             for kpi in kpis:
                 result = self.db.query(KPIResult).filter(KPIResult.kpi_id == kpi.id).first()
                 if not result or result.value is None:
                     continue
-                series_vals = [p.get("value") for p in (result.time_series or []) if p.get("value") is not None]
-                trend = linear_trend(series_vals)
-                anomalies = zscore_anomalies(series_vals) + iqr_outliers(series_vals)
-                change = period_change(result.value, result.previous_value)
+                # Statistics run on complete periods only; the truncated final
+                # bucket would otherwise read as a crash in every series.
+                complete = _complete_points(result.time_series or [])
+                values = [p["value"] for p in complete]
+                trend = linear_trend(values)
+                anomalies = zscore_anomalies(values) + iqr_outliers(values)
+                season = seasonality(complete)
+
                 self.db.add(
                     AnalysisResult(
                         run_id=self.run_id,
                         analysis_type="trend",
                         metric=kpi.name,
                         details=trend,
-                        evidence={"series_points": len(series_vals)},
+                        evidence={"series_points": len(values), "sql": kpi.query_sql},
                     )
                 )
                 if anomalies:
+                    # Attach the period to each flagged point: "1,069,368 was
+                    # unusual" is only actionable once you know when.
+                    dated = [
+                        {
+                            **anomaly,
+                            "period": complete[anomaly["index"]]["period"]
+                            if anomaly["index"] < len(complete)
+                            else None,
+                            "unit": kpi.unit,
+                        }
+                        for anomaly in anomalies[:10]
+                    ]
                     self.db.add(
                         AnalysisResult(
                             run_id=self.run_id,
                             analysis_type="anomaly",
                             metric=kpi.name,
-                            details={"anomalies": anomalies[:10]},
-                            evidence={"method": "zscore+iqr"},
+                            details={"anomalies": dated},
+                            evidence={"method": "zscore+iqr", "periods_tested": len(complete)},
                         )
                     )
-                evidence_pack.append(
-                    {
-                        "kpi": kpi.name,
-                        "value": result.value,
-                        "previous": result.previous_value,
-                        "change_pct": result.change_pct,
-                        "formula": kpi.formula,
-                        "sql": kpi.query_sql,
-                        "trend": trend,
-                        "anomalies": anomalies[:5],
-                    }
-                )
-                if result.change_pct is not None:
-                    direction = "increased" if result.change_pct > 0 else "decreased"
-                    insights.append(
-                        Insight(
+                if season:
+                    self.db.add(
+                        AnalysisResult(
                             run_id=self.run_id,
-                            kpi_id=kpi.id,
-                            title=f"{kpi.name} {direction} by {abs(result.change_pct)*100:.1f}%",
-                            description=(
-                                f"{kpi.name} {direction} from {result.previous_value:.4g} to {result.value:.4g} "
-                                f"({result.change_pct*100:+.1f}%) based on {kpi.formula}."
-                            ),
-                            category="trend",
-                            evidence={"previous": result.previous_value, "current": result.value, "sql": kpi.query_sql},
+                            analysis_type="seasonality",
                             metric=kpi.name,
-                            value=result.value,
-                            comparison=f"{result.change_pct*100:+.1f}% vs previous period",
-                            period="period-over-period",
-                            severity="info" if abs(result.change_pct) < 0.2 else "warning",
-                            confidence=0.8 if trend.get("r2") else 0.6,
-                            query_sql=kpi.query_sql,
-                            grounded=True,
-                        )
-                    )
-                elif result.value is not None:
-                    insights.append(
-                        Insight(
-                            run_id=self.run_id,
-                            kpi_id=kpi.id,
-                            title=f"{kpi.name} = {result.value:.4g}",
-                            description=f"{kpi.name} was computed as {result.value:.4g} using {kpi.formula}.",
-                            category="finding",
-                            evidence={"current": result.value, "sql": kpi.query_sql},
-                            metric=kpi.name,
-                            value=result.value,
-                            comparison=None,
-                            period=None,
-                            severity="info",
-                            confidence=0.75,
-                            query_sql=kpi.query_sql,
-                            grounded=True,
-                        )
-                    )
-                if anomalies:
-                    top = anomalies[0]
-                    insights.append(
-                        Insight(
-                            run_id=self.run_id,
-                            kpi_id=kpi.id,
-                            title=f"Anomaly detected in {kpi.name}",
-                            description=f"Statistical {top['method']} flagged value {top['value']:.4g} in the {kpi.name} series.",
-                            category="anomaly",
-                            evidence={"anomaly": top, "series_len": len(series_vals)},
-                            metric=kpi.name,
-                            value=top["value"],
-                            severity="warning",
-                            confidence=0.7,
-                            query_sql=kpi.query_sql,
-                            grounded=True,
+                            details=season,
+                            evidence={"series_points": len(values)},
                         )
                     )
 
-            # Pareto / concentration on first categorical dimension with a numeric measure
-            for name, frame in self.tables.items():
-                cats = [c for c in frame.columns if frame[c].dtype in (pl.Utf8, pl.String) or "String" in str(frame[c].dtype)]
-                nums = [c for c in frame.columns if frame[c].dtype.is_numeric()]
-                if cats and nums:
-                    par = pareto(frame, cats[0], nums[0])
-                    self.db.add(AnalysisResult(run_id=self.run_id, analysis_type="pareto", metric=f"{nums[0]} by {cats[0]}", details=par, evidence={"table": name}))
-                    conc = concentration(frame, cats[0])
-                    if conc:
-                        self.db.add(AnalysisResult(run_id=self.run_id, analysis_type="concentration", metric=cats[0], details=conc, evidence={"table": name}))
-                corr = correlation_matrix(frame)
-                if corr:
-                    self.db.add(AnalysisResult(run_id=self.run_id, analysis_type="correlation", metric=name, details={"pairs": corr}, evidence={"table": name}))
+                evidence.append(
+                    {
+                        "kpi": kpi.name,
+                        "value": result.value,
+                        "unit": kpi.unit,
+                        "previous": result.previous_value,
+                        "change_pct": result.change_pct,
+                        "formula": kpi.formula,
+                        "trend": trend,
+                        "anomalies": anomalies[:5],
+                        "top_breakdown": (result.breakdown or [])[:5],
+                    }
+                )
+                insights.extend(self._insights_for(kpi, result, trend, anomalies, season, values))
+
+            insights.extend(self._structural_insights())
 
             llm = interpret_analyst(
                 {
                     "objective": self.project.business_objective,
-                    "evidence": evidence_pack,
+                    "domain": self.project.domain,
+                    "evidence": evidence,
                 }
             )
+            llm_added = 0
             if llm and isinstance(llm.get("insights"), list):
                 for item in llm["insights"]:
-                    if not _insight_grounded(item, evidence_pack):
+                    if not _insight_grounded(item, evidence):
+                        publish_event(
+                            str(self.run_id),
+                            "insight.rejected",
+                            {"title": item.get("title"), "reason": "not supported by computed evidence"},
+                        )
                         continue
                     insights.append(
                         Insight(
@@ -656,41 +944,336 @@ class PipelineExecutor:
                             grounded=True,
                         )
                     )
+                    llm_added += 1
+
+            generated = len(insights)
+            insights = _rank_insights(insights)
             for insight in insights:
                 self.db.add(insight)
                 publish_event(str(self.run_id), "insight.generated", {"title": insight.title})
-            return {"insights": len(insights), "analyses": len(evidence_pack), "llm": (llm or {}).get("_llm")}
 
-        return self._step("analyst", run)
+            return {
+                "insights": len(insights),
+                "insights_generated": generated,
+                "llm_insights_accepted": llm_added,
+                "metrics_analysed": len(evidence),
+                "llm": (llm or {}).get("_llm"),
+            }
 
-    def _dashboard(self):
-        def run():
-            kpis = self.db.query(KPI).filter(KPI.run_id == self.run_id, KPI.validation_status == "computed").all()
-            widgets_spec = self._default_dashboard(kpis)
+        summary = self.run_step("analyst", run, state)
+        state["status"] = "analysed"
+        state.setdefault("summaries", {})["analyst"] = summary
+        return state
+
+    def _insights_for(self, kpi, result, trend, anomalies, season, values) -> list[Insight]:
+        produced: list[Insight] = []
+        unit = kpi.unit or ""
+
+        meta = result.filters or {}
+        comparison_period = meta.get("comparison_period")
+        baseline_period = meta.get("baseline_period")
+        excluded = meta.get("partial_period_excluded")
+
+        if result.change_pct is not None:
+            direction = "increased" if result.change_pct > 0 else "decreased"
+            favourable = None
+            meaning = (kpi.filters or {}).get("higher_is_better")
+            if isinstance(meaning, bool):
+                favourable = (result.change_pct > 0) == meaning
+            severity = "info" if abs(result.change_pct) < 0.2 else "warning"
+            latest_value = _as_float(
+                next(
+                    (p["value"] for p in reversed(result.time_series or []) if not p.get("partial")),
+                    result.value,
+                )
+            )
+            produced.append(
+                Insight(
+                    run_id=self.run_id,
+                    kpi_id=kpi.id,
+                    title=(
+                        f"{kpi.name} {direction} {abs(result.change_pct) * 100:.1f}% "
+                        f"in {comparison_period or 'the latest period'}"
+                    ),
+                    description=(
+                        f"{kpi.name} moved from {result.previous_value:,.4g} in {baseline_period} "
+                        f"to {latest_value:,.4g} in {comparison_period} "
+                        f"({result.change_pct * 100:+.1f}%). Computed as {kpi.formula}."
+                        + ("" if favourable is None else f" This is {'favourable' if favourable else 'unfavourable'}.")
+                        + (
+                            f" {excluded} is excluded from this comparison because the data "
+                            "stops part-way through it."
+                            if excluded
+                            else ""
+                        )
+                    ),
+                    category="trend",
+                    evidence={
+                        "previous": result.previous_value,
+                        "current": result.value,
+                        "sql": kpi.query_sql,
+                    },
+                    metric=kpi.name,
+                    value=result.value,
+                    comparison=f"{result.change_pct * 100:+.1f}% vs {baseline_period}",
+                    period=str(comparison_period or "period-over-period"),
+                    severity=severity,
+                    confidence=0.85 if (trend.get("r2") or 0) > 0.3 else 0.7,
+                    query_sql=kpi.query_sql,
+                    grounded=True,
+                )
+            )
+        else:
+            produced.append(
+                Insight(
+                    run_id=self.run_id,
+                    kpi_id=kpi.id,
+                    title=f"{kpi.name} is {result.value:,.4g} {unit}".strip(),
+                    description=f"{kpi.name} was computed as {result.value:,.4g} using {kpi.formula}.",
+                    category="finding",
+                    evidence={"current": result.value, "sql": kpi.query_sql},
+                    metric=kpi.name,
+                    value=result.value,
+                    severity="info",
+                    confidence=0.75,
+                    query_sql=kpi.query_sql,
+                    grounded=True,
+                )
+            )
+
+        if trend.get("direction") in {"up", "down"} and len(values) >= 4:
+            produced.append(
+                Insight(
+                    run_id=self.run_id,
+                    kpi_id=kpi.id,
+                    title=f"{kpi.name} trends {trend['direction']} across {len(values)} periods",
+                    description=(
+                        f"A least-squares fit over {len(values)} periods gives a slope of "
+                        f"{trend['slope']:,.4g} per period with R^2 = {trend['r2']:.2f}."
+                    ),
+                    category="trend",
+                    evidence={"trend": trend, "series_points": len(values)},
+                    metric=kpi.name,
+                    value=result.value,
+                    period=f"{len(values)} periods",
+                    severity="info",
+                    confidence=min(0.95, 0.5 + float(trend.get("r2") or 0) / 2),
+                    query_sql=kpi.query_sql,
+                    grounded=True,
+                )
+            )
+
+        if anomalies:
+            top = max(anomalies, key=lambda a: abs(a.get("zscore", 0)))
+            series = _complete_points(result.time_series or [])
+            period = series[top["index"]]["period"] if top["index"] < len(series) else "unknown period"
+            produced.append(
+                Insight(
+                    run_id=self.run_id,
+                    kpi_id=kpi.id,
+                    title=f"Anomalous {kpi.name} in {period}",
+                    description=(
+                        f"{kpi.name} reached {top['value']:,.4g} in {period}, flagged by the "
+                        f"{top['method']} test"
+                        + (f" at z = {top['zscore']:.2f}." if "zscore" in top else ".")
+                    ),
+                    category="anomaly",
+                    evidence={"anomaly": top, "period": period, "series_len": len(series)},
+                    metric=kpi.name,
+                    value=top["value"],
+                    period=str(period),
+                    severity="warning",
+                    confidence=0.75,
+                    query_sql=kpi.query_sql,
+                    grounded=True,
+                )
+            )
+
+        breakdown = result.breakdown or []
+        additivity = (result.filters or {}).get("additivity", "additive")
+        # "X accounts for N% of the total" is only meaningful when the segment
+        # values actually sum to the total. Averages and ratios never do.
+        if len(breakdown) >= 3 and additivity == "additive":
+            total = sum(abs(_as_float(b["value"]) or 0) for b in breakdown)
+            top = breakdown[0]
+            share = (abs(_as_float(top["value"]) or 0) / total) if total else 0
+            if share >= 0.4:
+                produced.append(
+                    Insight(
+                        run_id=self.run_id,
+                        kpi_id=kpi.id,
+                        title=f"{top['dimension']} accounts for {share * 100:.1f}% of {kpi.name}",
+                        description=(
+                            f"Of the top {len(breakdown)} segments, {top['dimension']} contributes "
+                            f"{_as_float(top['value']):,.4g} of {total:,.4g} ({share * 100:.1f}%). "
+                            "Concentration this high makes the metric sensitive to a single segment."
+                        ),
+                        category="risk" if share >= 0.6 else "finding",
+                        evidence={"breakdown": breakdown[:5], "share": share},
+                        metric=kpi.name,
+                        value=_as_float(top["value"]),
+                        comparison=f"{share * 100:.1f}% of the top {len(breakdown)} segments",
+                        severity="warning" if share >= 0.6 else "info",
+                        confidence=0.8,
+                        query_sql=kpi.query_sql,
+                        grounded=True,
+                    )
+                )
+
+        if season and season.get("peak_period"):
+            produced.append(
+                Insight(
+                    run_id=self.run_id,
+                    kpi_id=kpi.id,
+                    title=f"{kpi.name} peaks in {season['peak_period']}",
+                    description=(
+                        f"Across the series, {season['peak_period']} is the strongest period "
+                        f"({season['peak_value']:,.4g}) and {season['trough_period']} the weakest "
+                        f"({season['trough_value']:,.4g}), a {season['amplitude_pct']:.1f}% spread."
+                    ),
+                    category="trend",
+                    evidence=season,
+                    metric=kpi.name,
+                    value=season["peak_value"],
+                    period=str(season["peak_period"]),
+                    severity="info",
+                    confidence=0.7,
+                    query_sql=kpi.query_sql,
+                    grounded=True,
+                )
+            )
+        return produced
+
+    def _structural_insights(self) -> list[Insight]:
+        """Pareto, concentration and correlation findings over the cleaned tables."""
+        produced: list[Insight] = []
+        assert self.binding is not None
+        measure = self.binding.roles.get("amount") or self.binding.roles.get("quantity")
+        for name, frame in self.tables.items():
+            dimension = next(
+                (d for d in self.binding.dimensions if d.table == name and d.evidence.get("logical_type") != "datetime"),
+                None,
+            )
+            if dimension and measure and measure.table == name and measure.column in frame.columns:
+                result = pareto(frame, dimension.column, measure.column)
+                self.db.add(
+                    AnalysisResult(
+                        run_id=self.run_id,
+                        analysis_type="pareto",
+                        metric=f"{measure.column} by {dimension.column}",
+                        details=result,
+                        evidence={"table": name},
+                    )
+                )
+                if result.get("items") and result.get("cutoff_count"):
+                    total_segments = len(result["items"])
+                    produced.append(
+                        Insight(
+                            run_id=self.run_id,
+                            title=(
+                                f"{result['cutoff_count']} of {total_segments} {dimension.column} values "
+                                f"drive 80% of {measure.column}"
+                            ),
+                            description=(
+                                f"Cumulative share of {measure.column} by {dimension.column} reaches 80% "
+                                f"after {result['cutoff_count']} segments out of the {total_segments} shown."
+                            ),
+                            category="opportunity",
+                            evidence={"pareto": result["items"][:8]},
+                            metric=f"{measure.column} by {dimension.column}",
+                            value=float(result["cutoff_count"]),
+                            severity="info",
+                            confidence=0.8,
+                            grounded=True,
+                        )
+                    )
+                focus = concentration(frame, dimension.column)
+                if focus:
+                    self.db.add(
+                        AnalysisResult(
+                            run_id=self.run_id,
+                            analysis_type="concentration",
+                            metric=dimension.column,
+                            details=focus,
+                            evidence={"table": name},
+                        )
+                    )
+            pairs = correlation_matrix(frame)
+            if pairs:
+                self.db.add(
+                    AnalysisResult(
+                        run_id=self.run_id,
+                        analysis_type="correlation",
+                        metric=name,
+                        details={"pairs": pairs},
+                        evidence={"table": name},
+                    )
+                )
+                strongest = pairs[0]
+                if abs(strongest["correlation"]) >= 0.5:
+                    produced.append(
+                        Insight(
+                            run_id=self.run_id,
+                            title=(
+                                f"{strongest['left']} and {strongest['right']} move together "
+                                f"(r = {strongest['correlation']:.2f})"
+                            ),
+                            description=(
+                                f"Pearson correlation of {strongest['correlation']:.3f} between "
+                                f"{strongest['left']} and {strongest['right']} in {name}. "
+                                "Correlation is not causation; treat this as a lead for investigation."
+                            ),
+                            category="finding",
+                            evidence={"correlation": strongest, "table": name},
+                            metric=f"{strongest['left']} ~ {strongest['right']}",
+                            value=strongest["correlation"],
+                            severity="info",
+                            confidence=0.65,
+                            grounded=True,
+                        )
+                    )
+        return produced
+
+    # ------------------------------------------------------------------
+    def dashboard(self, state: PipelineState) -> PipelineState:
+        def run() -> dict[str, Any]:
+            self._clear(DashboardDefinition, cascade_widgets=True)
+            kpis = (
+                self.db.query(KPI)
+                .filter(KPI.run_id == self.run_id, KPI.validation_status == "computed")
+                .all()
+            )
+            specs = self._default_dashboard(kpis)
             llm = interpret_dashboard(
                 {
                     "objective": self.project.business_objective,
-                    "kpis": [{"name": k.name, "slug": k.slug, "formula": k.formula, "unit": k.unit} for k in kpis],
+                    "kpis": [
+                        {"name": k.name, "slug": k.slug, "formula": k.formula, "unit": k.unit}
+                        for k in kpis
+                    ],
                 }
             )
             if llm and isinstance(llm.get("widgets"), list):
-                widgets_spec = self._merge_dashboard(widgets_spec, llm["widgets"], kpis)
-            dash = DashboardDefinition(
+                specs = self._merge_dashboard(specs, llm["widgets"], kpis)
+
+            dashboard = DashboardDefinition(
                 run_id=self.run_id,
                 project_id=self.project_id,
-                title=llm.get("title") if llm else f"{self.project.name} dashboard",
+                title=(llm or {}).get("title") or f"{self.project.name} — {self.project.domain} overview",
                 layout={"columns": 12},
                 published=False,
                 audit_status="pending",
             )
-            self.db.add(dash)
+            self.db.add(dashboard)
             self.db.flush()
-            kpi_by_slug = {k.slug: k for k in kpis}
-            kpi_by_name = {_slug(k.name): k for k in kpis}
-            for spec in widgets_spec:
-                kpi = kpi_by_slug.get(spec.get("kpi_slug") or "") or kpi_by_name.get(_slug(spec.get("kpi_slug") or spec.get("title") or ""))
-                result = self.db.query(KPIResult).filter(KPIResult.kpi_id == kpi.id).first() if kpi else None
-                data = {}
+
+            by_slug = {k.slug: k for k in kpis}
+            for spec in specs:
+                kpi = by_slug.get(spec.get("kpi_slug") or "")
+                result = (
+                    self.db.query(KPIResult).filter(KPIResult.kpi_id == kpi.id).first() if kpi else None
+                )
+                data: dict[str, Any] = {}
                 if result:
                     data = {
                         "value": result.value,
@@ -698,11 +1281,38 @@ class PipelineExecutor:
                         "change_pct": result.change_pct,
                         "series": result.time_series,
                         "breakdown": result.breakdown,
+                        "unit": kpi.unit if kpi else None,
+                        "format": (result.filters or {}).get("format", {}),
                     }
-                pos = spec.get("position") or {}
+                if spec["type"] == "table":
+                    data["rows"] = [
+                        {
+                            "name": k.name,
+                            "value": (
+                                self.db.query(KPIResult)
+                                .filter(KPIResult.kpi_id == k.id)
+                                .first()
+                                .value
+                            ),
+                            "unit": k.unit,
+                            "formula": k.formula,
+                        }
+                        for k in kpis
+                    ]
+                if spec["type"] == "anomaly":
+                    data["anomalies"] = [
+                        {"metric": a.metric, **(a.details or {})}
+                        for a in self.db.query(AnalysisResult)
+                        .filter(
+                            AnalysisResult.run_id == self.run_id,
+                            AnalysisResult.analysis_type == "anomaly",
+                        )
+                        .all()
+                    ]
+                position = spec.get("position") or {}
                 self.db.add(
                     DashboardWidget(
-                        dashboard_id=dash.id,
+                        dashboard_id=dashboard.id,
                         widget_type=spec["type"],
                         title=spec["title"],
                         kpi_id=kpi.id if kpi else None,
@@ -710,59 +1320,125 @@ class PipelineExecutor:
                         dimensions=spec.get("dimensions") or [],
                         measures=spec.get("measures") or [],
                         format=spec.get("format") or {},
-                        position_x=int(pos.get("x", 0)),
-                        position_y=int(pos.get("y", 0)),
-                        width=int(pos.get("w", 3)),
-                        height=int(pos.get("h", 2)),
+                        position_x=int(position.get("x", 0)),
+                        position_y=int(position.get("y", 0)),
+                        width=int(position.get("w", 3)),
+                        height=int(position.get("h", 2)),
                         data=data,
                         explanation=spec.get("reason"),
                     )
                 )
-            publish_event(str(self.run_id), "dashboard.generated", {"widgets": len(widgets_spec)})
-            return {"widgets": len(widgets_spec), "llm": (llm or {}).get("_llm")}
+            publish_event(str(self.run_id), "dashboard.generated", {"widgets": len(specs)})
+            return {"widgets": len(specs), "kpis": len(kpis), "llm": (llm or {}).get("_llm")}
 
-        return self._step("dashboard", run)
+        summary = self.run_step("dashboard", run, state)
+        state["status"] = "dashboard_built"
+        state.setdefault("summaries", {})["dashboard"] = summary
+        return state
 
-    def _auditor(self):
-        def run():
+    def _default_dashboard(self, kpis: list[KPI]) -> list[dict[str, Any]]:
+        widgets: list[dict[str, Any]] = []
+        headline = kpis[:4]
+        for index, kpi in enumerate(headline):
+            widgets.append(
+                {
+                    "type": "kpi",
+                    "title": kpi.name,
+                    "kpi_slug": kpi.slug,
+                    "format": (kpi.filters or {}).get("format", {}),
+                    "position": {"x": index * 3, "y": 0, "w": 3, "h": 2},
+                    "reason": kpi.business_meaning,
+                }
+            )
+        primary = next((k for k in kpis if k.unit == "currency"), kpis[0] if kpis else None)
+        if primary is not None:
+            widgets.append(
+                {
+                    "type": "line",
+                    "title": f"{primary.name} over time",
+                    "kpi_slug": primary.slug,
+                    "position": {"x": 0, "y": 2, "w": 8, "h": 4},
+                    "reason": "Trend of the primary monetary metric at the detected time grain.",
+                }
+            )
+            widgets.append(
+                {
+                    "type": "bar",
+                    "title": f"{primary.name} by segment",
+                    "kpi_slug": primary.slug,
+                    "position": {"x": 8, "y": 2, "w": 4, "h": 4},
+                    "reason": "Breakdown across the highest-confidence chartable dimension.",
+                }
+            )
+        if len(kpis) > 1:
+            widgets.append(
+                {
+                    "type": "table",
+                    "title": "KPI catalog",
+                    "kpi_slug": kpis[0].slug,
+                    "position": {"x": 0, "y": 6, "w": 12, "h": 3},
+                    "reason": "Every computed KPI with its formula, for inspection.",
+                }
+            )
+        widgets.append(
+            {
+                "type": "anomaly",
+                "title": "Statistical anomalies",
+                "kpi_slug": kpis[0].slug if kpis else None,
+                "position": {"x": 0, "y": 9, "w": 12, "h": 3},
+                "reason": "Points flagged by the z-score and IQR tests on KPI series.",
+            }
+        )
+        return widgets
+
+    def _merge_dashboard(self, base, proposed, kpis: list[KPI]) -> list[dict[str, Any]]:
+        slugs = {k.slug for k in kpis}
+        allowed = {"kpi", "line", "bar", "area", "scatter", "map", "table", "ranking", "anomaly"}
+        extra = [
+            item
+            for item in proposed
+            if item.get("type") in allowed and (not item.get("kpi_slug") or item["kpi_slug"] in slugs)
+        ]
+        return extra or base
+
+    # ------------------------------------------------------------------
+    def auditor(self, state: PipelineState) -> PipelineState:
+        def run() -> dict[str, Any]:
+            self._clear(AuditEvent)
+            self._clear(XAIExplanation)
             kpis = self.db.query(KPI).filter(KPI.run_id == self.run_id).all()
             insights = self.db.query(Insight).filter(Insight.run_id == self.run_id).all()
-            dash = self.db.query(DashboardDefinition).filter(DashboardDefinition.run_id == self.run_id).first()
-            findings = []
+            dashboard = (
+                self.db.query(DashboardDefinition)
+                .filter(DashboardDefinition.run_id == self.run_id)
+                .first()
+            )
+
+            findings: list[dict[str, Any]] = []
             for kpi in kpis:
-                ok = kpi.validation_status == "computed" and kpi.query_sql is not None
-                findings.append({"entity_type": "kpi", "entity": kpi.name, "status": "VALID" if ok else "INVALID", "message": kpi.validation_status})
+                valid = kpi.validation_status == "computed" and kpi.query_sql is not None
+                findings.append(
+                    {
+                        "entity_type": "kpi",
+                        "entity": kpi.name,
+                        "status": "VALID" if valid else "INVALID",
+                        "message": kpi.validation_status,
+                    }
+                )
                 self.db.add(
                     AuditEvent(
                         run_id=self.run_id,
                         event_type="kpi_validation",
-                        severity="info" if ok else "error",
+                        severity="info" if valid else "error",
                         message=f"KPI {kpi.name}: {kpi.validation_status}",
                         entity_type="kpi",
                         entity_id=str(kpi.id),
-                        details={"formula": kpi.formula, "sql": kpi.query_sql},
-                        status="VALID" if ok else "INVALID",
+                        details={"formula": kpi.formula, "sql": kpi.query_sql, "provenance": kpi.filters},
+                        status="VALID" if valid else "INVALID",
                     )
                 )
-                result = self.db.query(KPIResult).filter(KPIResult.kpi_id == kpi.id).first()
-                self.db.add(
-                    XAIExplanation(
-                        run_id=self.run_id,
-                        entity_type="kpi",
-                        entity_id=str(kpi.id),
-                        what_happened=f"{kpi.name} evaluated to {result.value if result else 'n/a'}.",
-                        how_calculated=f"Formula {kpi.formula} compiled to SQL and executed on cleaned parquet tables.",
-                        data_used=", ".join(kpi.data_sources or []),
-                        kpi_relevance=kpi.business_meaning,
-                        assumptions="Aggregation uses cleaned layer after recorded transformations. Outer joins may introduce nulls.",
-                        quality_limitations="See data quality report for missingness and referential issues.",
-                        transformations="Recorded in transformations table for this run.",
-                        producer_agent="semantic",
-                        validator_agent="auditor",
-                        extra={"sql": kpi.query_sql},
-                    )
-                )
-            ungrounded = [i for i in insights if not i.grounded]
+                self.db.add(self._explain(kpi))
+
             for insight in insights:
                 self.db.add(
                     AuditEvent(
@@ -776,273 +1452,567 @@ class PipelineExecutor:
                         status="VALID" if insight.grounded else "REJECTED",
                     )
                 )
-            dash_status = "VALID" if dash and dash.widgets else "INVALID"
-            if dash:
-                dash.audit_status = dash_status
-                dash.published = dash_status == "VALID"
+
+            computed = sum(1 for k in kpis if k.validation_status == "computed")
+            ratio = computed / len(kpis) if kpis else 0.0
+            quality_score = _as_float((state.get("quality_report") or {}).get("overall_score")) or 0.0
+            retries = state.get("retry") or {}
+
+            # The verdict decides the next edge in the graph.
+            if computed == 0 or ratio < MIN_KPI_SUCCESS_RATIO:
+                status = "retry_semantic"
+                reason = (
+                    f"Only {computed} of {len(kpis)} KPIs computed "
+                    f"({ratio:.0%}, below the {MIN_KPI_SUCCESS_RATIO:.0%} bar)."
+                )
+            elif quality_score and quality_score < MIN_ACCEPTABLE_QUALITY:
+                status = "retry_quality"
+                reason = (
+                    f"Data quality scored {quality_score:.1f}, below the "
+                    f"{MIN_ACCEPTABLE_QUALITY} threshold for publishing."
+                )
+            elif not (dashboard and dashboard.widgets):
+                status = "INVALID"
+                reason = "No dashboard widgets were produced."
+            else:
+                status = "VALID"
+                reason = (
+                    f"{computed} of {len(kpis)} KPIs computed, quality {quality_score:.1f}, "
+                    f"{len(dashboard.widgets)} widgets bound to computed metrics."
+                )
+
+            caveats = [
+                note
+                for inference in self.inferences.values()
+                for note in inference.warnings
+            ]
+            if self.binding is not None:
+                caveats.extend(self.binding.unbound_notes)
+
             llm = interpret_auditor(
                 {
-                    "kpis": [{"name": k.name, "formula": k.formula, "status": k.validation_status} for k in kpis],
+                    "kpis": [
+                        {"name": k.name, "formula": k.formula, "status": k.validation_status}
+                        for k in kpis
+                    ],
                     "insight_count": len(insights),
-                    "ungrounded": len(ungrounded),
+                    "verdict": status,
+                    "reason": reason,
                 }
             )
-            publish_event(str(self.run_id), "audit.completed", {"status": dash_status})
-            self.project.status = "ready" if dash_status == "VALID" else "audited_with_issues"
-            return {"findings": len(findings), "dashboard_status": dash_status, "llm": (llm or {}).get("_llm")}
+            return {
+                "status": status,
+                "reason": reason,
+                "findings": len(findings),
+                "kpi_success_ratio": round(ratio, 4),
+                "caveats": caveats,
+                "llm": (llm or {}).get("_llm"),
+            }
 
-        return self._step("auditor", run)
+        summary = self.run_step("auditor", run, state)
+        status = summary.get("status", "INVALID")
+        reason = summary.get("reason", "")
 
-    def _evaluate(self) -> None:
+        # The retry budget is consumed here, inside the node, because LangGraph
+        # only persists state a node returns -- a counter incremented in a
+        # routing function is thrown away, and the graph loops forever.
+        budget = get_settings().pipeline_max_retries
+        retries = dict(state.get("retry") or {})
+        if status.startswith("retry"):
+            key = "audit_quality" if status == "retry_quality" else "audit_semantic"
+            used = int(retries.get(key, 0))
+            if used >= budget:
+                status = "VALID"
+                reason += (
+                    f" Retry budget for {key} exhausted after {used} attempts; "
+                    "published with the caveats above rather than retried further."
+                )
+            else:
+                retries[key] = used + 1
+                state["retry"] = retries
+
+        summary["status"] = status
+        summary["reason"] = reason
+        summary["retry"] = retries
+        self._record_verdict(summary)
+
+        state["audit"] = summary
+        state["status"] = "audited"
+        state.setdefault("summaries", {})["auditor"] = summary
+        return state
+
+    def _record_verdict(self, summary: dict[str, Any]) -> None:
+        """Persist the final verdict once the retry budget has been applied."""
+        status = summary.get("status", "INVALID")
+        self.db.query(AuditEvent).filter(
+            AuditEvent.run_id == self.run_id, AuditEvent.event_type == "run_verdict"
+        ).delete(synchronize_session=False)
+        self.db.add(
+            AuditEvent(
+                run_id=self.run_id,
+                event_type="run_verdict",
+                severity="info" if status == "VALID" else "warning",
+                message=summary.get("reason", ""),
+                entity_type="run",
+                entity_id=str(self.run_id),
+                details={
+                    "kpi_success_ratio": summary.get("kpi_success_ratio"),
+                    "caveats": summary.get("caveats", []),
+                    "retries": summary.get("retry", {}),
+                },
+                status=status,
+            )
+        )
+        dashboard = (
+            self.db.query(DashboardDefinition)
+            .filter(DashboardDefinition.run_id == self.run_id)
+            .first()
+        )
+        if dashboard is not None:
+            dashboard.audit_status = "VALID" if status == "VALID" else "PENDING"
+            dashboard.published = status == "VALID"
+        self.db.commit()
+        publish_event(
+            str(self.run_id), "audit.completed", {"status": status, "reason": summary.get("reason")}
+        )
+
+    def _explain(self, kpi: KPI) -> XAIExplanation:
+        result = self.db.query(KPIResult).filter(KPIResult.kpi_id == kpi.id).first()
+        provenance = kpi.filters or {}
+        roles = provenance.get("roles") or {}
+        role_text = ", ".join(f"{role} = {column}" for role, column in roles.items()) or "none bound"
+        transformations = (
+            self.db.query(Transformation).filter(Transformation.run_id == self.run_id).all()
+        )
+        applied = ", ".join(
+            f"{t.operation} on {t.table_name}"
+            + (f".{t.column_name}" if t.column_name else "")
+            + f" ({t.rows_affected} rows)"
+            for t in transformations
+        ) or "none"
+        caveats = [
+            note for inference in self.inferences.values() for note in inference.warnings
+        ]
+        return XAIExplanation(
+            run_id=self.run_id,
+            entity_type="kpi",
+            entity_id=str(kpi.id),
+            what_happened=(
+                f"{kpi.name} evaluated to {result.value if result else 'no value'}"
+                + (f" {kpi.unit}" if kpi.unit else "")
+                + "."
+            ),
+            how_calculated=(
+                f"The formula {kpi.formula} was parsed, checked against the table schema, and "
+                f"compiled to the SQL below, then executed on the cleaned Parquet layer. "
+                f"SQL: {kpi.query_sql}"
+            ),
+            data_used=", ".join(kpi.data_sources or []) or "n/a",
+            kpi_relevance=kpi.business_meaning,
+            assumptions=(
+                f"Business roles were bound as: {role_text}. "
+                + (
+                    f"Revenue basis: {provenance['revenue_basis']}. "
+                    if provenance.get("revenue_basis")
+                    else ""
+                )
+                + (
+                    f"Row filter applied: {'; '.join(provenance['filters'])}. "
+                    if provenance.get("filters")
+                    else ""
+                )
+                + "Division by zero yields NULL rather than an error."
+            ),
+            quality_limitations="; ".join(caveats) or "No type-inference caveats were raised.",
+            transformations=applied,
+            producer_agent="semantic",
+            validator_agent="auditor",
+            extra={"sql": kpi.query_sql, "provenance": provenance},
+        )
+
+    # ------------------------------------------------------------------
+    def publish(self, state: PipelineState) -> PipelineState:
+        self._evaluate(state)
+        verdict = (state.get("audit") or {}).get("status", "VALID")
+        self.run.status = "completed"
+        self.run.completed_at = datetime.now(timezone.utc)
+        self.run.current_step = "completed"
+        self.project.status = "ready" if verdict == "VALID" else "audited_with_issues"
+        self.db.commit()
+        publish_event(str(self.run_id), "pipeline.completed", {"status": "completed", "verdict": verdict})
+        state["status"] = "published"
+        return state
+
+    def _evaluate(self, state: PipelineState) -> None:
+        """Score each agent, and compare the pipeline to a naive baseline."""
+        self._clear(EvaluationResult)
         kpis = self.db.query(KPI).filter(KPI.run_id == self.run_id).all()
-        valid = sum(1 for k in kpis if k.validation_status == "computed")
-        self.db.add(EvaluationResult(run_id=self.run_id, agent_name="semantic", metric_name="kpi_formula_validity", score=valid / max(len(kpis), 1), details={"valid": valid, "total": len(kpis)}))
         insights = self.db.query(Insight).filter(Insight.run_id == self.run_id).all()
-        grounded = sum(1 for i in insights if i.grounded)
-        self.db.add(EvaluationResult(run_id=self.run_id, agent_name="analyst", metric_name="insight_factuality", score=grounded / max(len(insights), 1), details={"grounded": grounded, "total": len(insights)}))
         profiles = self.db.query(DataProfile).filter(DataProfile.run_id == self.run_id).all()
-        self.db.add(EvaluationResult(run_id=self.run_id, agent_name="profiler", metric_name="tables_profiled", score=1.0 if profiles else 0.0, details={"count": len(profiles)}))
+        valid = sum(1 for k in kpis if k.validation_status == "computed")
+        grounded = sum(1 for i in insights if i.grounded)
+
+        def record(agent: str, metric: str, score: float, details: dict[str, Any]) -> None:
+            self.db.add(
+                EvaluationResult(
+                    run_id=self.run_id,
+                    agent_name=agent,
+                    metric_name=metric,
+                    score=round(float(score), 4),
+                    details=details,
+                )
+            )
+
+        record(
+            "semantic",
+            "kpi_formula_validity",
+            valid / max(len(kpis), 1),
+            {"valid": valid, "total": len(kpis)},
+        )
+        record(
+            "analyst",
+            "insight_groundedness",
+            grounded / max(len(insights), 1),
+            {"grounded": grounded, "total": len(insights)},
+        )
+        record(
+            "profiler",
+            "tables_profiled",
+            1.0 if profiles else 0.0,
+            {"count": len(profiles)},
+        )
+
+        # Type inference is the step that silently destroyed data before; it is
+        # now scored explicitly, per column.
+        decisions = [c for inference in self.inferences.values() for c in inference.columns]
+        resolved = [c for c in decisions if c.action != "keep" or c.target_type != "String"]
+        lossless = [c for c in decisions if (c.parse_rate or 1.0) >= 1.0]
+        record(
+            "profiler",
+            "type_inference_resolution",
+            len(resolved) / max(len(decisions), 1),
+            {
+                "columns": len(decisions),
+                "typed": len(resolved),
+                "lossless": len(lossless),
+                "decisions": [c.model_dump() for c in decisions],
+            },
+        )
+
+        # Baseline: what a non-agentic script gets by summing every numeric
+        # column. Reported as coverage, to show what the semantic layer adds.
+        baseline_measures = sum(
+            1
+            for profile in self.profiles.values()
+            for column in profile.columns
+            if column.logical_type in {"currency", "quantity", "numeric"} and not column.is_candidate_pk
+        )
+        catalog_kpis = sum(1 for k in kpis if (k.filters or {}).get("template"))
+        record(
+            "semantic",
+            "vs_naive_baseline",
+            catalog_kpis / max(baseline_measures, 1),
+            {
+                "baseline_kpis": baseline_measures,
+                "baseline_method": "one SUM/AVG per numeric column, no business meaning",
+                "catalog_kpis": catalog_kpis,
+                "note": (
+                    "The baseline cannot express row-level arithmetic, so it has no revenue, "
+                    "no average order value and no return rate."
+                ),
+            },
+        )
+        record(
+            "auditor",
+            "verdict_confidence",
+            1.0 if (state.get("audit") or {}).get("status") == "VALID" else 0.5,
+            {"verdict": (state.get("audit") or {}).get("status")},
+        )
         self.db.commit()
 
+    # ------------------------------------------------------------------
     def _infer_semantic(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         dimensions: list[dict[str, Any]] = []
         measures: list[dict[str, Any]] = []
+        assert self.binding is not None
+        chartable = {(d.table, d.column) for d in self.binding.dimensions}
         for name, profile in self.profiles.items():
-            for col in profile.columns:
-                if col.logical_type in {"datetime", "categorical", "geo"} or (
-                    col.logical_type == "text" and col.distinct_count <= max(50, int(profile.row_count * 0.05))
-                ):
+            for column in profile.columns:
+                if (name, column.name) in chartable:
                     dimensions.append(
                         {
-                            "name": f"{name}.{col.name}",
+                            "name": f"{name}.{column.name}",
                             "table_name": name,
-                            "column_name": col.name,
-                            "dim_type": col.logical_type if col.logical_type in {"datetime", "categorical", "geo"} else "categorical",
-                            "grain": col.stats.get("granularity") if col.logical_type == "datetime" else None,
-                            "description": col.semantic_hint,
+                            "column_name": column.name,
+                            "dim_type": column.logical_type
+                            if column.logical_type in {"datetime", "categorical", "geo"}
+                            else "categorical",
+                            "grain": column.stats.get("granularity")
+                            if column.logical_type == "datetime"
+                            else None,
+                            "description": column.semantic_hint,
                         }
                     )
-                if col.logical_type in {"currency", "quantity", "numeric"} and not col.is_candidate_pk:
-                    agg = "SUM" if col.logical_type in {"currency", "quantity"} else "AVG"
+                if column.logical_type in {"currency", "quantity", "numeric"} and not column.is_candidate_pk:
                     measures.append(
                         {
-                            "name": f"{name}.{col.name}",
+                            "name": f"{name}.{column.name}",
                             "table_name": name,
-                            "column_name": col.name,
-                            "aggregation": agg,
-                            "unit": "currency" if col.logical_type == "currency" else None,
-                            "description": col.semantic_hint,
+                            "column_name": column.name,
+                            "aggregation": "SUM"
+                            if column.logical_type in {"currency", "quantity"}
+                            else "AVG",
+                            "unit": "currency" if column.logical_type == "currency" else None,
+                            "description": column.semantic_hint,
                         }
                     )
         return dimensions[:80], measures[:80]
 
-    def _heuristic_kpis(self, measures: list[dict[str, Any]], dimensions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        specs: list[dict[str, Any]] = []
-        money = [m for m in measures if m.get("unit") == "currency"] or [m for m in measures if m["aggregation"] == "SUM"]
-        id_cols = []
-        for name, profile in self.profiles.items():
-            for col in profile.columns:
-                if col.is_candidate_pk or col.logical_type == "identifier":
-                    id_cols.append((name, col.name, col.uniqueness_pct))
-        if money:
-            m = money[0]
-            formula = f"SUM({m['table_name']}.{m['column_name']})"
-            specs.append(
-                {
-                    "name": "Total Amount",
-                    "description": f"Sum of {m['name']}",
-                    "business_meaning": "Primary additive monetary or volume measure inferred from the schema.",
-                    "formula": formula,
-                    "unit": m.get("unit") or "units",
-                    "confidence": 0.75,
-                    "dimensions": [d["name"] for d in dimensions if d["dim_type"] == "datetime"][:1],
-                }
-            )
-            if id_cols:
-                table, col, _ = sorted(id_cols, key=lambda x: -x[2])[0]
-                specs.append(
-                    {
-                        "name": "Average per identifier",
-                        "description": f"{formula} / COUNT_DISTINCT({table}.{col})",
-                        "business_meaning": "Ratio of the primary additive measure to distinct identifiers.",
-                        "formula": f"{formula} / COUNT_DISTINCT({table}.{col})",
-                        "unit": m.get("unit"),
-                        "confidence": 0.65,
-                    }
-                )
-        if id_cols:
-            table, col, _ = sorted(id_cols, key=lambda x: -x[2])[0]
-            specs.append(
-                {
-                    "name": "Record count",
-                    "description": f"Distinct {table}.{col}",
-                    "business_meaning": "Volume of distinct identifiers in the dataset.",
-                    "formula": f"COUNT_DISTINCT({table}.{col})",
-                    "unit": "count",
-                    "confidence": 0.8,
-                }
-            )
-        # Additional SUM/AVG measures as KPIs (bounded)
-        for meas in measures[:6]:
-            name = f"{meas['aggregation'].title()} of {meas['column_name']}"
-            specs.append(
-                {
-                    "name": name,
-                    "description": name,
-                    "business_meaning": meas.get("description") or name,
-                    "formula": f"{meas['aggregation']}({meas['table_name']}.{meas['column_name']})",
-                    "unit": meas.get("unit"),
-                    "confidence": 0.6,
-                }
-            )
-        # de-dupe by formula
-        unique: dict[str, dict[str, Any]] = {}
-        for spec in specs:
-            unique[spec["formula"]] = spec
-        return list(unique.values())[:12]
-
-    def _merge_llm_kpis(self, base: list[dict[str, Any]], proposed: list[dict[str, Any]], measures: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        known_cols = {f"{m['table_name']}.{m['column_name']}" for m in measures}
-        for name, profile in self.profiles.items():
-            for col in profile.columns:
-                known_cols.add(f"{name}.{col.name}")
-        merged = {s["formula"]: s for s in base}
+    def _merge_llm_kpis(
+        self, base: list[InstantiatedKPI], proposed: list[dict[str, Any]]
+    ) -> list[InstantiatedKPI]:
+        """Accept LLM KPIs only if they compile against the real schema."""
+        merged = {spec.formula: spec for spec in base}
         for item in proposed:
             formula = (item.get("formula") or "").strip()
-            if not formula:
+            if not formula or formula in merged:
                 continue
             try:
-                compiled = compile_formula(formula, [])
-            except FormulaError:
+                compile_formula(formula, [], schema=self.schema)
+            except FormulaError as exc:
+                publish_event(
+                    str(self.run_id),
+                    "kpi.rejected",
+                    {"formula": formula, "reason": str(exc)},
+                )
                 continue
-            if any(col not in known_cols and "." in col for col in compiled.columns):
-                continue
-            merged[formula] = {
-                "name": item.get("name") or formula,
-                "description": item.get("description") or item.get("name") or formula,
-                "business_meaning": item.get("business_meaning") or item.get("description") or formula,
-                "formula": formula,
-                "unit": item.get("unit"),
-                "dimensions": item.get("dimensions") or [],
-                "confidence": float(item.get("confidence") or 0.6),
-            }
-        return list(merged.values())[:15]
-
-    def _breakdown(self, store: AnalyticalStore, compiled, spec: dict[str, Any]) -> list[dict[str, Any]]:
-        dims = spec.get("dimensions") or []
-        if not dims:
-            for d in self._first_cat_dim():
-                dims = [d]
-                break
-        if not dims:
-            return []
-        dim = dims[0]
-        if "." in dim:
-            table, col = dim.split(".", 1)
-        else:
-            return []
-        try:
-            sql = compiled.sql.replace("SELECT ", f'SELECT "{table}"."{col}" AS dimension, ', 1) + f' GROUP BY "{table}"."{col}" ORDER BY value DESC LIMIT 12'
-            frame = store.query(sql)
-            return [{"dimension": str(r["dimension"]), "value": _as_float(r["value"])} for r in frame.to_dicts()]
-        except Exception:
-            return []
-
-    def _time_series(self, store: AnalyticalStore, compiled, dimensions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        time_dims = [d for d in dimensions if d.get("dim_type") == "datetime"]
-        if not time_dims:
-            return []
-        d = time_dims[0]
-        try:
-            sql = (
-                compiled.sql.replace("SELECT ", f"SELECT date_trunc('month', \"{d['table_name']}\".\"{d['column_name']}\") AS period, ", 1)
-                + f" GROUP BY 1 ORDER BY 1"
+            name = item.get("name") or formula
+            merged[formula] = InstantiatedKPI(
+                slug=_slug(name),
+                name=name,
+                description=item.get("description") or name,
+                business_meaning=item.get("business_meaning") or item.get("description") or name,
+                formula=formula,
+                unit=item.get("unit") or "units",
+                confidence=min(0.9, float(item.get("confidence") or 0.6)),
+                priority=80,
+                dimensions=item.get("dimensions") or [],
+                source="llm",
+                provenance={"proposed_by": "llm", "validated_against_schema": True},
             )
-            frame = store.query(sql)
-            return [{"period": str(r["period"]), "value": _as_float(r["value"])} for r in frame.to_dicts() if r.get("period") is not None]
-        except Exception:
-            return []
+        return list(merged.values())[:24]
 
-    def _first_cat_dim(self) -> list[str]:
-        for name, profile in self.profiles.items():
-            for col in profile.columns:
-                if col.logical_type in {"categorical", "geo"}:
-                    return [f"{name}.{col.name}"]
-        return []
+    # ------------------------------------------------------------------
+    def _clear(self, model, **cascades: bool) -> None:
+        """Delete this run's rows for a model so a retry does not duplicate them."""
+        if model is DataProfile:
+            profiles = self.db.query(DataProfile).filter(DataProfile.run_id == self.run_id).all()
+            for profile in profiles:
+                self.db.query(DataProfileColumn).filter(
+                    DataProfileColumn.profile_id == profile.id
+                ).delete(synchronize_session=False)
+            self.db.query(DataProfile).filter(DataProfile.run_id == self.run_id).delete(
+                synchronize_session=False
+            )
+        elif model is DataQualityReport:
+            reports = (
+                self.db.query(DataQualityReport)
+                .filter(DataQualityReport.run_id == self.run_id)
+                .all()
+            )
+            for report in reports:
+                self.db.query(DataQualityIssue).filter(
+                    DataQualityIssue.report_id == report.id
+                ).delete(synchronize_session=False)
+            self.db.query(DataQualityReport).filter(
+                DataQualityReport.run_id == self.run_id
+            ).delete(synchronize_session=False)
+        elif model is KPI:
+            self.db.query(KPIResult).filter(KPIResult.run_id == self.run_id).delete(
+                synchronize_session=False
+            )
+            self.db.query(Insight).filter(Insight.run_id == self.run_id).update(
+                {Insight.kpi_id: None}, synchronize_session=False
+            )
+            self.db.query(DashboardWidget).filter(
+                DashboardWidget.kpi_id.in_(
+                    self.db.query(KPI.id).filter(KPI.run_id == self.run_id)
+                )
+            ).update({DashboardWidget.kpi_id: None}, synchronize_session=False)
+            self.db.query(KPI).filter(KPI.run_id == self.run_id).delete(synchronize_session=False)
+        elif model is SemanticModel:
+            models = self.db.query(SemanticModel).filter(SemanticModel.run_id == self.run_id).all()
+            for item in models:
+                for child in (Dimension, Measure, Relationship):
+                    self.db.query(child).filter(child.semantic_model_id == item.id).delete(
+                        synchronize_session=False
+                    )
+            self.db.query(SemanticModel).filter(SemanticModel.run_id == self.run_id).delete(
+                synchronize_session=False
+            )
+        elif model is DashboardDefinition:
+            dashboards = (
+                self.db.query(DashboardDefinition)
+                .filter(DashboardDefinition.run_id == self.run_id)
+                .all()
+            )
+            for dashboard in dashboards:
+                self.db.query(DashboardWidget).filter(
+                    DashboardWidget.dashboard_id == dashboard.id
+                ).delete(synchronize_session=False)
+            self.db.query(DashboardDefinition).filter(
+                DashboardDefinition.run_id == self.run_id
+            ).delete(synchronize_session=False)
+        else:
+            self.db.query(model).filter(model.run_id == self.run_id).delete(
+                synchronize_session=False
+            )
+        self.db.flush()
 
-    def _default_dashboard(self, kpis: list[KPI]) -> list[dict[str, Any]]:
-        widgets = []
-        x = 0
-        for kpi in kpis[:4]:
-            widgets.append({"type": "kpi", "title": kpi.name, "kpi_slug": kpi.slug, "position": {"x": x, "y": 0, "w": 3, "h": 2}, "reason": "Executive KPI card from computed metric."})
-            x += 3
-        if kpis:
-            widgets.append({"type": "line", "title": f"{kpis[0].name} over time", "kpi_slug": kpis[0].slug, "position": {"x": 0, "y": 2, "w": 8, "h": 4}, "reason": "Time series when a date dimension exists; otherwise empty state."})
-            widgets.append({"type": "bar", "title": f"{kpis[0].name} breakdown", "kpi_slug": kpis[0].slug, "position": {"x": 8, "y": 2, "w": 4, "h": 4}, "reason": "Categorical breakdown of the primary KPI."})
-        if len(kpis) > 1:
-            widgets.append({"type": "table", "title": "KPI catalog", "kpi_slug": kpis[0].slug, "position": {"x": 0, "y": 6, "w": 12, "h": 3}, "reason": "Tabular inspection of computed KPIs."})
-        widgets.append({"type": "anomaly", "title": "Anomalies", "kpi_slug": kpis[0].slug if kpis else None, "position": {"x": 0, "y": 9, "w": 6, "h": 3}, "reason": "Surface statistically detected anomalies."})
-        return widgets
+    # ------------------------------------------------------------------
+    def handlers(self) -> dict[str, Callable[[PipelineState], PipelineState]]:
+        return {
+            "orchestrator": self.orchestrator,
+            "profiler": self.profiler,
+            "quality": self.quality,
+            "semantic": self.semantic,
+            "analyst": self.analyst,
+            "dashboard": self.dashboard,
+            "auditor": self.auditor,
+            "publish": self.publish,
+        }
 
-    def _merge_dashboard(self, base, proposed, kpis: list[KPI]) -> list[dict[str, Any]]:
-        slugs = {k.slug for k in kpis}
-        allowed = {"kpi", "line", "bar", "area", "scatter", "map", "table", "ranking", "anomaly"}
-        extra = []
-        for item in proposed:
-            wtype = item.get("type")
-            if wtype not in allowed:
-                continue
-            slug = item.get("kpi_slug")
-            if slug and slug not in slugs:
-                continue
-            extra.append(item)
-        return extra or base
-
-    def _now(self):
-        from datetime import datetime, timezone
-
-        return datetime.now(timezone.utc)
+    def fail(self, error: str) -> None:
+        self.run.status = "failed"
+        self.run.error = error
+        self.run.completed_at = datetime.now(timezone.utc)
+        self.db.commit()
+        publish_event(str(self.run_id), "pipeline.failed", {"error": error})
 
 
-def _as_float(value: Any) -> float | None:
-    try:
-        if value is None:
-            return None
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+# Ranking weights. A report of sixty mechanical observations is not an
+# analysis; the point of the analyst agent is to decide what is worth saying.
+MAX_INSIGHTS = 24
+MAX_INSIGHTS_PER_KPI = 3
+CATEGORY_WEIGHT = {
+    "risk": 1.0,
+    "anomaly": 0.9,
+    "opportunity": 0.8,
+    "trend": 0.6,
+    "quality_caveat": 0.55,
+    "finding": 0.4,
+}
+SEVERITY_WEIGHT = {"critical": 1.0, "warning": 0.75, "info": 0.4}
 
 
-def _previous(series: list[dict[str, Any]]) -> float | None:
-    if len(series) < 2:
-        return None
-    return _as_float(series[-2].get("value"))
+def _insight_score(insight: Insight) -> float:
+    score = CATEGORY_WEIGHT.get(insight.category, 0.4) + SEVERITY_WEIGHT.get(insight.severity, 0.4)
+    score += float(insight.confidence or 0) * 0.5
+    # A 2% move is technically a trend and practically noise.
+    comparison = insight.comparison or ""
+    match = re.search(r"([-+]?\d+(?:\.\d+)?)%", comparison)
+    if match:
+        score += min(0.6, abs(float(match.group(1))) / 100)
+    return score
 
 
-def _change_from_series(series: list[dict[str, Any]]) -> float | None:
-    if len(series) < 2:
-        return None
-    prev = _as_float(series[-2].get("value"))
-    curr = _as_float(series[-1].get("value"))
-    if prev in (None, 0) or curr is None:
-        return None
-    return (curr - prev) / prev
+def _rank_insights(insights: list[Insight]) -> list[Insight]:
+    """Keep the strongest insights, spread across metrics.
+
+    Without the per-KPI cap a single volatile metric crowds out every other
+    finding, which is how an insight list becomes unreadable.
+    """
+    ordered = sorted(insights, key=_insight_score, reverse=True)
+    kept: list[Insight] = []
+    per_kpi: dict[Any, int] = {}
+    seen_titles: set[str] = set()
+    for insight in ordered:
+        title_key = insight.title.lower()
+        if title_key in seen_titles:
+            continue
+        key = insight.kpi_id or insight.metric or id(insight)
+        if per_kpi.get(key, 0) >= MAX_INSIGHTS_PER_KPI:
+            continue
+        kept.append(insight)
+        seen_titles.add(title_key)
+        per_kpi[key] = per_kpi.get(key, 0) + 1
+        if len(kept) >= MAX_INSIGHTS:
+            break
+    return kept
+
+
+def _next_period_start(start: datetime, grain: str) -> datetime:
+    if grain == "hour":
+        return start + timedelta(hours=1)
+    if grain == "day":
+        return start + timedelta(days=1)
+    if grain == "month":
+        return _add_months(start, 1)
+    if grain == "quarter":
+        return _add_months(start, 3)
+    return _add_months(start, 12)
+
+
+def _add_months(start: datetime, months: int) -> datetime:
+    month_index = start.month - 1 + months
+    year = start.year + month_index // 12
+    month = month_index % 12 + 1
+    return start.replace(year=year, month=month, day=1)
+
+
+# A period is judged complete once the data reaches within one unit of its
+# end. Without this tolerance the final period is flagged partial almost
+# always: a month "ends" at midnight on the 1st of the next month, and a
+# dataset whose last row is the 31st never contains that instant.
+_COMPLETENESS_TOLERANCE = {
+    "hour": timedelta(minutes=1),
+    "day": timedelta(hours=1),
+    "week": timedelta(days=1),
+    "month": timedelta(days=1),
+    "quarter": timedelta(days=1),
+    "year": timedelta(days=1),
+}
+
+
+def _is_partial_period(period: Any, grain: str, last_observation: datetime | None) -> bool:
+    """True when the data stops meaningfully before this bucket's period ends."""
+    if last_observation is None:
+        return False
+    if isinstance(period, datetime):
+        start = period
+    else:
+        try:
+            start = datetime.combine(period, datetime.min.time())
+        except (TypeError, ValueError):
+            return False
+    if start.tzinfo is not None:
+        start = start.replace(tzinfo=None)
+    reference = last_observation.replace(tzinfo=None) if last_observation.tzinfo else last_observation
+    tolerance = _COMPLETENESS_TOLERANCE.get(grain, timedelta(days=1))
+    return _next_period_start(start, grain) - tolerance > reference
+
+
+def _complete_points(series: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Series points safe to compare against each other."""
+    return [p for p in series if not p.get("partial") and p.get("value") is not None]
 
 
 def _insight_grounded(item: dict[str, Any], evidence: list[dict[str, Any]]) -> bool:
-    metric = (item.get("metric") or "").lower()
-    value = _as_float(item.get("value"))
+    """An LLM insight is kept only if its metric and value match a computed one."""
+    metric = (item.get("metric") or "").strip().lower()
     if not metric:
         return False
+    value = _as_float(item.get("value"))
     for row in evidence:
-        if metric not in row["kpi"].lower() and row["kpi"].lower() not in metric:
+        name = row["kpi"].lower()
+        if metric != name and metric not in name and name not in metric:
             continue
         if value is None:
             return True
-        actual = row.get("value")
+        actual = _as_float(row.get("value"))
         if actual is None:
             continue
         if actual == 0:
             return abs(value) < 1e-6
-        return abs(value - actual) / abs(actual) < 0.05 or abs(value - actual) < 1e-6
+        return abs(value - actual) / abs(actual) < 0.05
     return False
