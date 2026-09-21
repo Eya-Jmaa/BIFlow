@@ -43,16 +43,3 @@ class DatasetFile(TimestampMixin, Base):
     checksum: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     dataset = relationship("Dataset", back_populates="files")
-
-
-class DataSource(TimestampMixin, Base):
-    __tablename__ = "data_sources"
-
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    project_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("projects.id"), index=True)
-    name: Mapped[str] = mapped_column(String(200))
-    source_type: Mapped[str] = mapped_column(String(40))
-    config: Mapped[dict] = mapped_column(JSONB, default=dict)
-    status: Mapped[str] = mapped_column(String(40), default="configured")
-
-    project = relationship("Project", back_populates="data_sources")

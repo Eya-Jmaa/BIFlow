@@ -86,14 +86,6 @@ def seasonality(series: list[dict[str, Any]], min_points: int = 6) -> dict[str, 
     }
 
 
-def period_change(current: float | None, previous: float | None) -> dict[str, Any]:
-    if current is None or previous is None:
-        return {"change": None, "change_pct": None}
-    change = current - previous
-    change_pct = None if previous == 0 else change / previous
-    return {"change": change, "change_pct": change_pct}
-
-
 def pareto(frame: pl.DataFrame, dimension: str, measure: str, share: float = 0.8) -> dict[str, Any]:
     if dimension not in frame.columns or measure not in frame.columns or frame.height == 0:
         return {"items": [], "cutoff_count": 0}

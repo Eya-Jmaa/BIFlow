@@ -1,17 +1,27 @@
 "use client";
 
-import { Card } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
-import { api } from "@/lib/api";
 import { useQuery } from "@tanstack/react-query";
 import { useParams } from "next/navigation";
+import { Calendar, GitBranch, Hash, MapPin, Tag } from "lucide-react";
+
+import { Badge } from "@/components/ui/badge";
+import { Card, CardHeader } from "@/components/ui/card";
+import { Cell, EmptyState, Field, Row, Table } from "@/components/ui/data";
+import { api } from "@/lib/api";
 
 type Semantic = {
   domain: string;
   summary: string;
-  dimensions: Array<{ name: string; table_name: string; column_name: string; dim_type: string }>;
-  measures: Array<{ name: string; table_name: string; column_name: string; aggregation: string; unit: string | null }>;
-  relationships: Array<{
+  version: number;
+  dimensions: { name: string; table_name: string; column_name: string; dim_type: string }[];
+  measures: {
+    name: string;
+    table_name: string;
+    column_name: string;
+    aggregation: string;
+    unit: string | null;
+  }[];
+  relationships: {
     source_table: string;
     source_column: string;
     target_table: string;
@@ -20,71 +30,161 @@ type Semantic = {
     confidence: number;
     validated: boolean;
     overlap_ratio: number | null;
-  }>;
+  }[];
+};
+
+const DIM_ICON: Record<string, typeof Tag> = {
+  datetime: Calendar,
+  geo: MapPin,
+  categorical: Tag,
 };
 
 export default function SemanticPage() {
   const { id } = useParams<{ id: string }>();
-  const semantic = useQuery({ queryKey: ["semantic", id], queryFn: () => api.semantic(id), retry: false });
-  if (semantic.isError) return <Card><p className="text-sm text-slate-400">Semantic model not available yet.</p></Card>;
-  const model = semantic.data as Semantic | undefined;
-  if (!model) return <Card><p className="text-sm text-slate-400">Loading…</p></Card>;
+  const semantic = useQuery({
+    queryKey: ["semantic", id],
+    queryFn: () => api.semantic(id) as Promise<Semantic>,
+    retry: false,
+  });
+
+  if (semantic.isError) {
+    return (
+      <EmptyState
+        title="No semantic model yet"
+        message="The profiler binds business roles to columns and the semantic agent turns them into dimensions, measures and validated relationships."
+        icon={<GitBranch className="size-5" />}
+      />
+    );
+  }
+
+  const model = semantic.data;
+  if (!model) return <EmptyState title="Loading…" />;
 
   return (
     <div className="space-y-4">
       <Card>
-        <p className="text-xs uppercase text-slate-500">Domain</p>
-        <p className="text-lg font-semibold">{model.domain}</p>
-        <p className="text-sm text-slate-400">{model.summary}</p>
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div>
+            <p className="text-[0.6875rem] font-semibold tracking-wider text-ink-faint uppercase">
+              Inferred domain
+            </p>
+            <p className="mt-1 text-2xl font-semibold tracking-tight text-ink capitalize">
+              {model.domain}
+            </p>
+            <p className="mt-1 text-[0.8125rem] text-ink-muted">{model.summary}</p>
+          </div>
+          <Badge tone="brand">version {model.version}</Badge>
+        </div>
       </Card>
+
       <div className="grid gap-4 lg:grid-cols-2">
         <Card>
-          <h2 className="mb-2 text-sm font-semibold">Dimensions</h2>
-          <ul className="space-y-1 text-sm">
-            {model.dimensions.map((d) => (
-              <li key={d.name} className="flex justify-between gap-2 border-b border-slate-800 py-1">
-                <span>{d.name}</span>
-                <Badge>{d.dim_type}</Badge>
-              </li>
-            ))}
-          </ul>
+          <CardHeader
+            title="Dimensions"
+            subtitle="Columns the agent judged safe to group and chart by"
+            action={<Badge tone="neutral">{model.dimensions.length}</Badge>}
+          />
+          {model.dimensions.length === 0 ? (
+            <p className="text-[0.8125rem] text-ink-muted">None bound.</p>
+          ) : (
+            <ul className="space-y-1.5">
+              {model.dimensions.map((dimension) => {
+                const Icon = DIM_ICON[dimension.dim_type] ?? Tag;
+                return (
+                  <li
+                    key={dimension.name}
+                    className="flex items-center gap-3 rounded-lg px-2 py-2 hover:bg-surface-muted"
+                  >
+                    <span className="grid size-7 shrink-0 place-items-center rounded-lg bg-brand-soft text-brand">
+                      <Icon className="size-3.5" aria-hidden />
+                    </span>
+                    <span className="min-w-0 flex-1 truncate font-mono text-[0.75rem] text-ink-soft">
+                      {dimension.name}
+                    </span>
+                    <Badge tone="neutral">{dimension.dim_type}</Badge>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
         </Card>
+
         <Card>
-          <h2 className="mb-2 text-sm font-semibold">Measures</h2>
-          <ul className="space-y-1 text-sm">
-            {model.measures.map((m) => (
-              <li key={m.name} className="flex justify-between gap-2 border-b border-slate-800 py-1">
-                <span>{m.name}</span>
-                <span className="text-xs text-slate-500">{m.aggregation}</span>
-              </li>
-            ))}
-          </ul>
+          <CardHeader
+            title="Measures"
+            subtitle="Numeric columns available to aggregate"
+            action={<Badge tone="neutral">{model.measures.length}</Badge>}
+          />
+          {model.measures.length === 0 ? (
+            <p className="text-[0.8125rem] text-ink-muted">None bound.</p>
+          ) : (
+            <ul className="space-y-1.5">
+              {model.measures.map((measure) => (
+                <li
+                  key={measure.name}
+                  className="flex items-center gap-3 rounded-lg px-2 py-2 hover:bg-surface-muted"
+                >
+                  <span className="grid size-7 shrink-0 place-items-center rounded-lg bg-[#f6ecfe] text-accent">
+                    <Hash className="size-3.5" aria-hidden />
+                  </span>
+                  <span className="min-w-0 flex-1 truncate font-mono text-[0.75rem] text-ink-soft">
+                    {measure.name}
+                  </span>
+                  {measure.unit && <Badge tone="neutral">{measure.unit}</Badge>}
+                  <Badge tone="brand">{measure.aggregation}</Badge>
+                </li>
+              ))}
+            </ul>
+          )}
         </Card>
       </div>
+
       <Card>
-        <h2 className="mb-2 text-sm font-semibold">Validated relationships</h2>
-        <table className="w-full text-left text-sm">
-          <thead className="text-xs uppercase text-slate-500">
-            <tr>
-              <th className="pb-2">Source</th>
-              <th>Target</th>
-              <th>Cardinality</th>
-              <th>Overlap</th>
-              <th>Confidence</th>
-            </tr>
-          </thead>
-          <tbody>
-            {model.relationships.map((r) => (
-              <tr key={`${r.source_table}.${r.source_column}-${r.target_table}.${r.target_column}`} className="border-t border-slate-800">
-                <td className="py-1.5">{r.source_table}.{r.source_column}</td>
-                <td>{r.target_table}.{r.target_column}</td>
-                <td>{r.cardinality}</td>
-                <td>{r.overlap_ratio ?? "—"}</td>
-                <td>{r.confidence}</td>
-              </tr>
+        <CardHeader
+          title="Validated relationships"
+          subtitle="A join needs value overlap, type compatibility and uniqueness — a matching name is never enough."
+        />
+        {model.relationships.length === 0 ? (
+          <p className="text-[0.8125rem] text-ink-muted">
+            No relationships: this project has a single table, so nothing to join.
+          </p>
+        ) : (
+          <Table
+            head={[
+              "Source",
+              "Target",
+              "Cardinality",
+              <span key="o" className="block text-right">
+                Overlap
+              </span>,
+              <span key="c" className="block text-right">
+                Confidence
+              </span>,
+            ]}
+          >
+            {model.relationships.map((relationship) => (
+              <Row
+                key={`${relationship.source_table}.${relationship.source_column}-${relationship.target_table}.${relationship.target_column}`}
+              >
+                <Cell className="font-mono text-[0.6875rem]">
+                  {relationship.source_table}.{relationship.source_column}
+                </Cell>
+                <Cell className="font-mono text-[0.6875rem]">
+                  {relationship.target_table}.{relationship.target_column}
+                </Cell>
+                <Cell>
+                  <Badge tone="neutral">{relationship.cardinality.replace(/_/g, "-")}</Badge>
+                </Cell>
+                <Cell numeric>
+                  {relationship.overlap_ratio === null
+                    ? "—"
+                    : `${(relationship.overlap_ratio * 100).toFixed(1)}%`}
+                </Cell>
+                <Cell numeric>{(relationship.confidence * 100).toFixed(0)}%</Cell>
+              </Row>
             ))}
-          </tbody>
-        </table>
+          </Table>
+        )}
       </Card>
     </div>
   );

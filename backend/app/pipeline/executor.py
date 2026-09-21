@@ -63,6 +63,7 @@ from app.data.profiler import TableProfile, profile_frame
 from app.data.quality import QualityIssue, assess_quality, referential_issues
 from app.data.schema_infer import SchemaInference
 from app.data.store import AnalyticalStore
+from app.evaluation import metrics
 from app.domains.profiles import get_domain, infer_domain
 from app.logging import get_logger
 from app.models import (
@@ -996,8 +997,8 @@ class PipelineExecutor:
                         f"in {comparison_period or 'the latest period'}"
                     ),
                     description=(
-                        f"{kpi.name} moved from {result.previous_value:,.4g} in {baseline_period} "
-                        f"to {latest_value:,.4g} in {comparison_period} "
+                        f"{kpi.name} moved from {_humanize(result.previous_value)} in {baseline_period} "
+                        f"to {_humanize(latest_value)} in {comparison_period} "
                         f"({result.change_pct * 100:+.1f}%). Computed as {kpi.formula}."
                         + ("" if favourable is None else f" This is {'favourable' if favourable else 'unfavourable'}.")
                         + (
@@ -1028,8 +1029,8 @@ class PipelineExecutor:
                 Insight(
                     run_id=self.run_id,
                     kpi_id=kpi.id,
-                    title=f"{kpi.name} is {result.value:,.4g} {unit}".strip(),
-                    description=f"{kpi.name} was computed as {result.value:,.4g} using {kpi.formula}.",
+                    title=f"{kpi.name} is {_humanize(result.value)} {unit}".strip(),
+                    description=f"{kpi.name} was computed as {_humanize(result.value)} using {kpi.formula}.",
                     category="finding",
                     evidence={"current": result.value, "sql": kpi.query_sql},
                     metric=kpi.name,
@@ -1049,7 +1050,7 @@ class PipelineExecutor:
                     title=f"{kpi.name} trends {trend['direction']} across {len(values)} periods",
                     description=(
                         f"A least-squares fit over {len(values)} periods gives a slope of "
-                        f"{trend['slope']:,.4g} per period with R^2 = {trend['r2']:.2f}."
+                        f"{_humanize(trend['slope'])} per period with R^2 = {trend['r2']:.2f}."
                     ),
                     category="trend",
                     evidence={"trend": trend, "series_points": len(values)},
@@ -1073,7 +1074,7 @@ class PipelineExecutor:
                     kpi_id=kpi.id,
                     title=f"Anomalous {kpi.name} in {period}",
                     description=(
-                        f"{kpi.name} reached {top['value']:,.4g} in {period}, flagged by the "
+                        f"{kpi.name} reached {_humanize(top['value'])} in {period}, flagged by the "
                         f"{top['method']} test"
                         + (f" at z = {top['zscore']:.2f}." if "zscore" in top else ".")
                     ),
@@ -1105,7 +1106,7 @@ class PipelineExecutor:
                         title=f"{top['dimension']} accounts for {share * 100:.1f}% of {kpi.name}",
                         description=(
                             f"Of the top {len(breakdown)} segments, {top['dimension']} contributes "
-                            f"{_as_float(top['value']):,.4g} of {total:,.4g} ({share * 100:.1f}%). "
+                            f"{_humanize(top['value'])} of {_humanize(total)} ({share * 100:.1f}%). "
                             "Concentration this high makes the metric sensitive to a single segment."
                         ),
                         category="risk" if share >= 0.6 else "finding",
@@ -1128,8 +1129,8 @@ class PipelineExecutor:
                     title=f"{kpi.name} peaks in {season['peak_period']}",
                     description=(
                         f"Across the series, {season['peak_period']} is the strongest period "
-                        f"({season['peak_value']:,.4g}) and {season['trough_period']} the weakest "
-                        f"({season['trough_value']:,.4g}), a {season['amplitude_pct']:.1f}% spread."
+                        f"({_humanize(season['peak_value'])}) and {season['trough_period']} the weakest "
+                        f"({_humanize(season['trough_value'])}), a {season['amplitude_pct']:.1f}% spread."
                     ),
                     category="trend",
                     evidence=season,
@@ -1598,7 +1599,10 @@ class PipelineExecutor:
             entity_type="kpi",
             entity_id=str(kpi.id),
             what_happened=(
-                f"{kpi.name} evaluated to {result.value if result else 'no value'}"
+                f"{kpi.name} evaluated to "
+                # Full float precision is an artefact of binary arithmetic, not
+                # a measurement: "481.32644506882264" reads as false precision.
+                + (f"{result.value:,.2f}" if result and result.value is not None else "no value")
                 + (f" {kpi.unit}" if kpi.unit else "")
                 + "."
             ),
@@ -1644,13 +1648,33 @@ class PipelineExecutor:
         return state
 
     def _evaluate(self, state: PipelineState) -> None:
-        """Score each agent, and compare the pipeline to a naive baseline."""
+        """Score each agent and compare the run to a naive baseline.
+
+        The scoring lives in :mod:`app.evaluation.metrics` so the same
+        definitions back this table, the Audit screen and the exported report.
+        """
         self._clear(EvaluationResult)
-        kpis = self.db.query(KPI).filter(KPI.run_id == self.run_id).all()
-        insights = self.db.query(Insight).filter(Insight.run_id == self.run_id).all()
-        profiles = self.db.query(DataProfile).filter(DataProfile.run_id == self.run_id).all()
-        valid = sum(1 for k in kpis if k.validation_status == "computed")
-        grounded = sum(1 for i in insights if i.grounded)
+        kpis = [
+            {"validation_status": k.validation_status, "query_sql": k.query_sql, "filters": k.filters}
+            for k in self.db.query(KPI).filter(KPI.run_id == self.run_id).all()
+        ]
+        insights = [
+            {"grounded": i.grounded}
+            for i in self.db.query(Insight).filter(Insight.run_id == self.run_id).all()
+        ]
+        widgets = [
+            {"query_sql": w.query_sql, "data": w.data}
+            for w in self.db.query(DashboardWidget)
+            .join(DashboardDefinition)
+            .filter(DashboardDefinition.run_id == self.run_id)
+            .all()
+        ]
+        decisions = [
+            column.model_dump()
+            for inference in self.inferences.values()
+            for column in inference.columns
+        ]
+        profiles = self.db.query(DataProfile).filter(DataProfile.run_id == self.run_id).count()
 
         def record(agent: str, metric: str, score: float, details: dict[str, Any]) -> None:
             self.db.add(
@@ -1663,57 +1687,55 @@ class PipelineExecutor:
                 )
             )
 
+        computed = sum(1 for k in kpis if k["validation_status"] == "computed")
         record(
             "semantic",
             "kpi_formula_validity",
-            valid / max(len(kpis), 1),
-            {"valid": valid, "total": len(kpis)},
+            metrics.formula_validity(kpis),
+            {"valid": computed, "total": len(kpis)},
         )
         record(
             "analyst",
             "insight_groundedness",
-            grounded / max(len(insights), 1),
-            {"grounded": grounded, "total": len(insights)},
+            metrics.insight_groundedness(insights),
+            {
+                "grounded": sum(1 for i in insights if i["grounded"]),
+                "total": len(insights),
+                "hallucination_rate": round(metrics.hallucination_rate(insights), 4),
+            },
         )
         record(
-            "profiler",
-            "tables_profiled",
-            1.0 if profiles else 0.0,
-            {"count": len(profiles)},
+            "dashboard",
+            "widgets_bound_to_data",
+            metrics.dashboard_validity(widgets),
+            {"widgets": len(widgets)},
         )
-
-        # Type inference is the step that silently destroyed data before; it is
-        # now scored explicitly, per column.
-        decisions = [c for inference in self.inferences.values() for c in inference.columns]
-        resolved = [c for c in decisions if c.action != "keep" or c.target_type != "String"]
-        lossless = [c for c in decisions if (c.parse_rate or 1.0) >= 1.0]
         record(
             "profiler",
             "type_inference_resolution",
-            len(resolved) / max(len(decisions), 1),
+            metrics.type_inference_resolution(decisions),
             {
                 "columns": len(decisions),
-                "typed": len(resolved),
-                "lossless": len(lossless),
-                "decisions": [c.model_dump() for c in decisions],
+                "lossless": sum(1 for d in decisions if (d.get("parse_rate") or 1.0) >= 1.0),
+                "tables_profiled": profiles,
+                "decisions": decisions,
             },
         )
 
-        # Baseline: what a non-agentic script gets by summing every numeric
-        # column. Reported as coverage, to show what the semantic layer adds.
-        baseline_measures = sum(
+        baseline_kpis = sum(
             1
             for profile in self.profiles.values()
             for column in profile.columns
-            if column.logical_type in {"currency", "quantity", "numeric"} and not column.is_candidate_pk
+            if column.logical_type in {"currency", "quantity", "numeric"}
+            and not column.is_candidate_pk
         )
-        catalog_kpis = sum(1 for k in kpis if (k.filters or {}).get("template"))
+        catalog_kpis = sum(1 for k in kpis if (k["filters"] or {}).get("template"))
         record(
             "semantic",
             "vs_naive_baseline",
-            catalog_kpis / max(baseline_measures, 1),
+            metrics.baseline_lift(catalog_kpis, baseline_kpis),
             {
-                "baseline_kpis": baseline_measures,
+                "baseline_kpis": baseline_kpis,
                 "baseline_method": "one SUM/AVG per numeric column, no business meaning",
                 "catalog_kpis": catalog_kpis,
                 "note": (
@@ -1730,7 +1752,6 @@ class PipelineExecutor:
         )
         self.db.commit()
 
-    # ------------------------------------------------------------------
     def _infer_semantic(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         dimensions: list[dict[str, Any]] = []
         measures: list[dict[str, Any]] = []
@@ -1939,6 +1960,24 @@ def _rank_insights(insights: list[Insight]) -> list[Insight]:
         if len(kept) >= MAX_INSIGHTS:
             break
     return kept
+
+
+def _humanize(value: Any) -> str:
+    """Format a number the way a person writes it in a sentence.
+
+    ``format(9601159.72, ",.4g")`` produces "9.601e+06", which is correct and
+    unreadable. Insight text is prose, so it gets thousands separators and a
+    decimal place only where one carries information.
+    """
+    number = _as_float(value)
+    if number is None:
+        return "n/a"
+    magnitude = abs(number)
+    if magnitude >= 1000:
+        return f"{number:,.0f}"
+    if magnitude >= 1:
+        return f"{number:,.2f}".rstrip("0").rstrip(".")
+    return f"{number:,.4g}"
 
 
 def _next_period_start(start: datetime, grain: str) -> datetime:

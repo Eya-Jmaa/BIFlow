@@ -72,17 +72,3 @@ class AgentRun(TimestampMixin, Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     run = relationship("PipelineRun", back_populates="agent_runs")
-    messages = relationship("AgentMessage", back_populates="agent_run", cascade="all, delete-orphan")
-
-
-class AgentMessage(TimestampMixin, Base):
-    __tablename__ = "agent_messages"
-
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    agent_run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("agent_runs.id"), index=True)
-    role: Mapped[str] = mapped_column(String(40))
-    content: Mapped[str] = mapped_column(Text)
-    token_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    extra: Mapped[dict] = mapped_column(JSONB, default=dict)
-
-    agent_run = relationship("AgentRun", back_populates="messages")

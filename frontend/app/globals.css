@@ -1,141 +1,114 @@
 @import "tailwindcss";
-@import "tw-animate-css";
-@import "shadcn/tailwind.css";
 
-@custom-variant dark (&:is(.dark *));
+/*
+  BIFlow design tokens.
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-sans);
-  --font-mono: var(--font-geist-mono);
-  --font-heading: var(--font-sans);
-  --color-sidebar-ring: var(--sidebar-ring);
-  --color-sidebar-border: var(--sidebar-border);
-  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
-  --color-sidebar-accent: var(--sidebar-accent);
-  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
-  --color-sidebar-primary: var(--sidebar-primary);
-  --color-sidebar-foreground: var(--sidebar-foreground);
-  --color-sidebar: var(--sidebar);
-  --color-chart-5: var(--chart-5);
-  --color-chart-4: var(--chart-4);
-  --color-chart-3: var(--chart-3);
-  --color-chart-2: var(--chart-2);
-  --color-chart-1: var(--chart-1);
-  --color-ring: var(--ring);
-  --color-input: var(--input);
-  --color-border: var(--border);
-  --color-destructive: var(--destructive);
-  --color-accent-foreground: var(--accent-foreground);
-  --color-accent: var(--accent);
-  --color-muted-foreground: var(--muted-foreground);
-  --color-muted: var(--muted);
-  --color-secondary-foreground: var(--secondary-foreground);
-  --color-secondary: var(--secondary);
-  --color-primary-foreground: var(--primary-foreground);
-  --color-primary: var(--primary);
-  --color-popover-foreground: var(--popover-foreground);
-  --color-popover: var(--popover);
-  --color-card-foreground: var(--card-foreground);
-  --color-card: var(--card);
-  --radius-sm: calc(var(--radius) * 0.6);
-  --radius-md: calc(var(--radius) * 0.8);
-  --radius-lg: var(--radius);
-  --radius-xl: calc(var(--radius) * 1.4);
-  --radius-2xl: calc(var(--radius) * 1.8);
-  --radius-3xl: calc(var(--radius) * 2.2);
-  --radius-4xl: calc(var(--radius) * 2.6);
+  One light theme, deliberately: a second theme that is an automatic inversion
+  of the first is worse than none, and the chart palette below was validated
+  against this surface specifically.
+
+  The chart slots are a validated categorical set — fixed order, never cycled,
+  never reassigned by rank. Slots 3 and 4 fall below 3:1 against white, which
+  is allowed only because every chart in the app also ships a table view.
+*/
+
+@theme {
+  /* Surfaces */
+  --color-canvas: #f4f5fb;
+  --color-surface: #ffffff;
+  --color-surface-muted: #f8f9fd;
+  --color-surface-sunken: #eef0f9;
+  --color-shell: #14162b;
+  --color-shell-muted: #1e2138;
+
+  /* Ink */
+  --color-ink: #12142a;
+  --color-ink-soft: #4a4f6b;
+  --color-ink-muted: #7c81a0;
+  --color-ink-faint: #a5a9c2;
+
+  /* Lines */
+  --color-line: #e6e8f4;
+  --color-line-strong: #d3d7ea;
+
+  /* Brand */
+  --color-brand: #5b5bf0;
+  --color-brand-strong: #4a46d8;
+  --color-brand-soft: #eceafe;
+  --color-accent: #b06ef5;
+
+  /* Status — reserved, never reused as a series colour */
+  --color-good: #12a150;
+  --color-warn: #d98500;
+  --color-bad: #d93b4b;
+  --color-good-soft: #e6f7ee;
+  --color-warn-soft: #fdf3e2;
+  --color-bad-soft: #fdecee;
+
+  /* Validated categorical chart slots (light surface) */
+  --color-series-1: #2a78d6;
+  --color-series-2: #eb6834;
+  --color-series-3: #1baf7a;
+  --color-series-4: #eda100;
+  --color-series-5: #e87ba4;
+  --color-series-6: #008300;
+  --color-series-7: #4a3aa7;
+  --color-series-8: #e34948;
+
+  --radius-card: 1rem;
+
+  --shadow-card: 0 1px 2px rgb(18 20 42 / 0.04), 0 8px 24px -12px rgb(18 20 42 / 0.12);
+  --shadow-lift: 0 2px 4px rgb(18 20 42 / 0.05), 0 16px 40px -16px rgb(18 20 42 / 0.2);
+  --shadow-shell: 0 12px 40px -12px rgb(18 20 42 / 0.35);
 }
 
 html,
 body {
-  background: var(--background);
-  color: var(--foreground);
+  height: 100%;
+}
+
+body {
+  background-color: var(--color-canvas);
+  color: var(--color-ink);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* A quiet wash so the canvas reads as depth rather than flat grey. */
+.app-canvas {
+  background-image:
+    radial-gradient(60rem 40rem at 12% -10%, #e7e6fe 0%, transparent 60%),
+    radial-gradient(50rem 36rem at 95% 0%, #e4effe 0%, transparent 55%);
+  background-attachment: fixed;
 }
 
 *:focus-visible {
-  outline: 2px solid #3b82f6;
+  outline: 2px solid var(--color-brand);
   outline-offset: 2px;
+  border-radius: 4px;
 }
 
-:root {
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.145 0 0);
-  --card: oklch(1 0 0);
-  --card-foreground: oklch(0.145 0 0);
-  --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.145 0 0);
-  --primary: oklch(0.205 0 0);
-  --primary-foreground: oklch(0.985 0 0);
-  --secondary: oklch(0.97 0 0);
-  --secondary-foreground: oklch(0.205 0 0);
-  --muted: oklch(0.97 0 0);
-  --muted-foreground: oklch(0.556 0 0);
-  --accent: oklch(0.97 0 0);
-  --accent-foreground: oklch(0.205 0 0);
-  --destructive: oklch(0.577 0.245 27.325);
-  --border: oklch(0.922 0 0);
-  --input: oklch(0.922 0 0);
-  --ring: oklch(0.708 0 0);
-  --chart-1: oklch(0.87 0 0);
-  --chart-2: oklch(0.556 0 0);
-  --chart-3: oklch(0.439 0 0);
-  --chart-4: oklch(0.371 0 0);
-  --chart-5: oklch(0.269 0 0);
-  --radius: 0.625rem;
-  --sidebar: oklch(0.985 0 0);
-  --sidebar-foreground: oklch(0.145 0 0);
-  --sidebar-primary: oklch(0.205 0 0);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.97 0 0);
-  --sidebar-accent-foreground: oklch(0.205 0 0);
-  --sidebar-border: oklch(0.922 0 0);
-  --sidebar-ring: oklch(0.708 0 0);
+/* Scrollbars, so an inner scroll area does not look like a rendering bug. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line-strong) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background-color: var(--color-line-strong);
+  border-radius: 999px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
 }
 
-.dark {
-  --background: oklch(0.16 0.02 260);
-  --foreground: oklch(0.93 0.01 250);
-  --card: oklch(0.20 0.02 260);
-  --card-foreground: oklch(0.93 0.01 250);
-  --popover: oklch(0.20 0.02 260);
-  --popover-foreground: oklch(0.93 0.01 250);
-  --primary: oklch(0.62 0.15 255);
-  --primary-foreground: oklch(0.98 0 0);
-  --secondary: oklch(0.269 0 0);
-  --secondary-foreground: oklch(0.985 0 0);
-  --muted: oklch(0.269 0 0);
-  --muted-foreground: oklch(0.708 0 0);
-  --accent: oklch(0.269 0 0);
-  --accent-foreground: oklch(0.985 0 0);
-  --destructive: oklch(0.704 0.191 22.216);
-  --border: oklch(1 0 0 / 10%);
-  --input: oklch(1 0 0 / 15%);
-  --ring: oklch(0.556 0 0);
-  --chart-1: oklch(0.87 0 0);
-  --chart-2: oklch(0.556 0 0);
-  --chart-3: oklch(0.439 0 0);
-  --chart-4: oklch(0.371 0 0);
-  --chart-5: oklch(0.269 0 0);
-  --sidebar: oklch(0.205 0 0);
-  --sidebar-foreground: oklch(0.985 0 0);
-  --sidebar-primary: oklch(0.488 0.243 264.376);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.269 0 0);
-  --sidebar-accent-foreground: oklch(0.985 0 0);
-  --sidebar-border: oklch(1 0 0 / 10%);
-  --sidebar-ring: oklch(0.556 0 0);
-}
-
-@layer base {
-  * {
-    @apply border-border outline-ring/50;
-  }
-  body {
-    @apply bg-background text-foreground;
-  }
-  html {
-    @apply font-sans;
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
   }
 }

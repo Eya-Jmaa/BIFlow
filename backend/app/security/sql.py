@@ -9,8 +9,6 @@ data. Parsing the statement and inspecting its nodes has neither problem.
 
 from __future__ import annotations
 
-import re
-
 import sqlglot
 from sqlglot import exp
 
@@ -77,11 +75,6 @@ def _function_names(node: exp.Func) -> set[str]:
     if isinstance(getattr(node, "this", None), str):
         names.add(node.this.lower())
     return names
-
-
-def assert_readonly_identifier(value: str) -> None:
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value or ""):
-        raise ValueError(f"Unsafe identifier: {value}")
 
 
 def validate_readonly_sql(sql: str, *, allow_internal_functions: bool = False) -> str:

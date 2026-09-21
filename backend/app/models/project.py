@@ -18,9 +18,6 @@ class Project(TimestampMixin, Base):
     business_objective: Mapped[str] = mapped_column(Text)
     domain: Mapped[str] = mapped_column(String(80), default="general")
     status: Mapped[str] = mapped_column(String(40), default="draft")
-    owner_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
 
-    owner = relationship("User", back_populates="projects")
     datasets = relationship("Dataset", back_populates="project", cascade="all, delete-orphan")
-    data_sources = relationship("DataSource", back_populates="project", cascade="all, delete-orphan")
     pipeline_runs = relationship("PipelineRun", back_populates="project", cascade="all, delete-orphan")

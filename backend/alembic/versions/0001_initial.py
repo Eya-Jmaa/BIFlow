@@ -10,17 +10,6 @@ from sqlalchemy.dialects import postgresql
 
 def upgrade() -> None:
     op.create_table(
-        "users",
-        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column("email", sa.String(320), nullable=False, unique=True),
-        sa.Column("name", sa.String(200), nullable=False),
-        sa.Column("hashed_password", sa.String(255)),
-        sa.Column("is_active", sa.Boolean(), server_default=sa.true()),
-        sa.Column("last_login_at", sa.DateTime(timezone=True)),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
-        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
-    )
-    op.create_table(
         "projects",
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
         sa.Column("name", sa.String(200), nullable=False),
@@ -28,7 +17,6 @@ def upgrade() -> None:
         sa.Column("business_objective", sa.Text(), nullable=False),
         sa.Column("domain", sa.String(80), server_default="general"),
         sa.Column("status", sa.String(40), server_default="draft"),
-        sa.Column("owner_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("users.id")),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
     )
@@ -60,17 +48,6 @@ def upgrade() -> None:
         sa.Column("delimiter", sa.String(8)),
         sa.Column("storage_path", sa.Text(), nullable=False),
         sa.Column("checksum", sa.String(128)),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
-        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
-    )
-    op.create_table(
-        "data_sources",
-        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column("project_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("projects.id"), nullable=False),
-        sa.Column("name", sa.String(200), nullable=False),
-        sa.Column("source_type", sa.String(40), nullable=False),
-        sa.Column("config", postgresql.JSONB, server_default=sa.text("'{}'::jsonb")),
-        sa.Column("status", sa.String(40), server_default="configured"),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
     )
@@ -127,17 +104,6 @@ def upgrade() -> None:
         sa.Column("output_summary", postgresql.JSONB, server_default=sa.text("'{}'::jsonb")),
         sa.Column("validation_result", postgresql.JSONB, server_default=sa.text("'{}'::jsonb")),
         sa.Column("error", sa.Text()),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
-        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
-    )
-    op.create_table(
-        "agent_messages",
-        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column("agent_run_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("agent_runs.id"), nullable=False),
-        sa.Column("role", sa.String(40), nullable=False),
-        sa.Column("content", sa.Text(), nullable=False),
-        sa.Column("token_count", sa.Integer()),
-        sa.Column("extra", postgresql.JSONB, server_default=sa.text("'{}'::jsonb")),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
     )
@@ -450,14 +416,11 @@ def downgrade() -> None:
         "data_quality_reports",
         "data_profile_columns",
         "data_profiles",
-        "agent_messages",
         "agent_runs",
         "pipeline_steps",
         "pipeline_runs",
-        "data_sources",
         "dataset_files",
         "datasets",
         "projects",
-        "users",
     ]:
         op.drop_table(table)

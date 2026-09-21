@@ -1,6 +1,9 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import { Calendar, Check, ChevronDown, Filter, Loader2, X } from "lucide-react";
+
+import { Toggle } from "@/components/ui/button";
 import type { DashboardFilter, FilterDimension } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -28,11 +31,12 @@ export const EMPTY_FILTERS: FilterState = {
   grain: "month",
 };
 
+// Presets before a custom range: nobody fights a calendar grid for "last 90 days".
 const PRESETS = [
   { label: "All time", months: null },
-  { label: "Last 3 months", months: 3 },
-  { label: "Last 6 months", months: 6 },
-  { label: "Last 12 months", months: 12 },
+  { label: "3 months", months: 3 },
+  { label: "6 months", months: 6 },
+  { label: "12 months", months: 12 },
 ] as const;
 
 export function buildFilters(state: FilterState, dateColumn: string | null): DashboardFilter[] {
@@ -62,15 +66,19 @@ export function DashboardFilters({
   busy?: boolean;
 }) {
   const [open, setOpen] = useState(false);
+
   const dateDimension = useMemo(
-    () => dimensions.find((d) => d.type === "datetime") ?? null,
+    () => dimensions.find((dimension) => dimension.type === "datetime") ?? null,
     [dimensions],
   );
   const categorical = useMemo(
-    () => dimensions.filter((d) => d.type !== "datetime" && (d.values?.length ?? 0) > 0),
+    () =>
+      dimensions.filter(
+        (dimension) => dimension.type !== "datetime" && (dimension.values?.length ?? 0) > 0,
+      ),
     [dimensions],
   );
-  const active = categorical.find((d) => d.name === state.dimension) ?? categorical[0] ?? null;
+  const active = categorical.find((item) => item.name === state.dimension) ?? categorical[0] ?? null;
 
   const applyPreset = (months: number | null) => {
     if (!dateDimension?.max) return;
@@ -99,7 +107,7 @@ export function DashboardFilters({
 
   const toggleValue = (value: string) => {
     const next = state.values.includes(value)
-      ? state.values.filter((v) => v !== value)
+      ? state.values.filter((item) => item !== value)
       : [...state.values, value];
     onChange({ ...state, dimension: active?.name ?? null, values: next });
   };
@@ -107,42 +115,34 @@ export function DashboardFilters({
   const hasFilters = Boolean(state.from) || state.values.length > 0;
 
   return (
-    <div className="rounded-md border border-slate-800 bg-slate-950/60">
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-2 p-3">
+    <div className="rounded-card border border-line bg-surface shadow-card">
+      <div className="flex flex-wrap items-center gap-x-5 gap-y-3 p-3">
         {dateDimension && (
-          <div className="flex items-center gap-1.5">
-            <span className="text-[11px] uppercase tracking-wide text-slate-500">Period</span>
-            <div className="flex flex-wrap gap-1">
-              {PRESETS.map((preset) => {
-                const selected = activePreset === preset.label;
-                return (
-                  <button
-                    key={preset.label}
-                    type="button"
-                    onClick={() => applyPreset(preset.months)}
-                    aria-pressed={selected}
-                    className={cn(
-                      "rounded border px-2 py-1 text-xs transition-colors",
-                      selected
-                        ? "border-blue-700 bg-blue-950 text-blue-200"
-                        : "border-slate-800 text-slate-400 hover:bg-slate-900",
-                    )}
-                  >
-                    {selected && <span className="mr-1 font-bold">✓</span>}
-                    {preset.label}
-                  </button>
-                );
-              })}
+          <div className="flex items-center gap-2">
+            <Calendar className="size-3.5 shrink-0 text-ink-faint" aria-hidden />
+            <div className="flex rounded-lg bg-surface-sunken p-0.5">
+              {PRESETS.map((preset) => (
+                <Toggle
+                  key={preset.label}
+                  active={activePreset === preset.label}
+                  onClick={() => applyPreset(preset.months)}
+                >
+                  {activePreset === preset.label && <Check className="size-3" aria-hidden />}
+                  {preset.label}
+                </Toggle>
+              ))}
             </div>
           </div>
         )}
 
-        <div className="flex items-center gap-1.5">
-          <span className="text-[11px] uppercase tracking-wide text-slate-500">Grain</span>
+        <label className="flex items-center gap-2">
+          <span className="text-[0.6875rem] font-semibold tracking-wider text-ink-faint uppercase">
+            Grain
+          </span>
           <select
             value={state.grain}
             onChange={(event) => onChange({ ...state, grain: event.target.value })}
-            className="rounded border border-slate-800 bg-slate-950 px-2 py-1 text-xs text-slate-300"
+            className="rounded-lg border border-line-strong bg-surface px-2.5 py-1.5 text-xs text-ink-soft focus:border-brand"
           >
             {(dateDimension?.grains ?? ["month"]).map((grain) => (
               <option key={grain} value={grain}>
@@ -150,16 +150,15 @@ export function DashboardFilters({
               </option>
             ))}
           </select>
-        </div>
+        </label>
 
         {active && (
-          <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-2">
+            <Filter className="size-3.5 shrink-0 text-ink-faint" aria-hidden />
             <select
               value={active.name}
-              onChange={(event) =>
-                onChange({ ...state, dimension: event.target.value, values: [] })
-              }
-              className="rounded border border-slate-800 bg-slate-950 px-2 py-1 text-xs text-slate-300"
+              onChange={(event) => onChange({ ...state, dimension: event.target.value, values: [] })}
+              className="rounded-lg border border-line-strong bg-surface px-2.5 py-1.5 text-xs text-ink-soft focus:border-brand"
             >
               {categorical.map((dimension) => (
                 <option key={dimension.name} value={dimension.name}>
@@ -171,30 +170,45 @@ export function DashboardFilters({
               type="button"
               onClick={() => setOpen((value) => !value)}
               aria-expanded={open}
-              className="rounded border border-slate-800 px-2 py-1 text-xs text-slate-400 hover:bg-slate-900"
+              className={cn(
+                "inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs transition-colors",
+                state.values.length
+                  ? "border-brand/25 bg-brand-soft text-brand-strong"
+                  : "border-line-strong text-ink-muted hover:bg-surface-muted",
+              )}
             >
               {state.values.length ? `${state.values.length} selected` : "All values"}
-              <span className="ml-1 text-slate-600">{open ? "▴" : "▾"}</span>
+              <ChevronDown
+                className={cn("size-3 transition-transform", open && "rotate-180")}
+                aria-hidden
+              />
             </button>
           </div>
         )}
 
-        {hasFilters && (
-          <button
-            type="button"
-            onClick={() => onChange({ ...EMPTY_FILTERS, grain: state.grain })}
-            className="text-xs text-slate-500 underline-offset-2 hover:text-slate-300 hover:underline"
-          >
-            Clear
-          </button>
-        )}
-
-        {busy && <span className="text-xs text-slate-500">Updating…</span>}
+        <div className="ml-auto flex items-center gap-3">
+          {busy && (
+            <span className="flex items-center gap-1.5 text-xs text-ink-muted">
+              <Loader2 className="size-3 animate-spin text-brand" aria-hidden />
+              Updating
+            </span>
+          )}
+          {hasFilters && (
+            <button
+              type="button"
+              onClick={() => onChange({ ...EMPTY_FILTERS, grain: state.grain })}
+              className="inline-flex items-center gap-1 text-xs text-ink-muted transition-colors hover:text-ink"
+            >
+              <X className="size-3" aria-hidden />
+              Clear
+            </button>
+          )}
+        </div>
       </div>
 
       {open && active && (
-        <div className="max-h-48 overflow-auto border-t border-slate-800 p-3">
-          <div className="flex flex-wrap gap-1">
+        <div className="max-h-52 overflow-auto border-t border-line p-3">
+          <div className="flex flex-wrap gap-1.5">
             {(active.values ?? []).map((value) => {
               const selected = state.values.includes(value);
               return (
@@ -204,13 +218,13 @@ export function DashboardFilters({
                   onClick={() => toggleValue(value)}
                   aria-pressed={selected}
                   className={cn(
-                    "rounded border px-2 py-1 text-xs transition-colors",
+                    "inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs transition-colors",
                     selected
-                      ? "border-blue-700 bg-blue-950 text-blue-200"
-                      : "border-slate-800 text-slate-400 hover:bg-slate-900",
+                      ? "bg-brand text-white"
+                      : "bg-surface-sunken text-ink-soft hover:bg-line",
                   )}
                 >
-                  {selected && <span className="mr-1 font-bold">✓</span>}
+                  {selected && <Check className="size-3" aria-hidden />}
                   {value}
                 </button>
               );

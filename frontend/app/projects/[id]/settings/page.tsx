@@ -1,15 +1,28 @@
 "use client";
 
-import { Button } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
-import { api } from "@/lib/api";
+import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useParams, useRouter } from "next/navigation";
+import { Download, FileJson, FileSpreadsheet, FileText, Table2, Trash2 } from "lucide-react";
+
+import { Button } from "@/components/ui/button";
+import { Card, CardHeader } from "@/components/ui/card";
+import { Field } from "@/components/ui/data";
+import { api } from "@/lib/api";
+
+const FORMATS = [
+  { key: "json", label: "JSON", hint: "Full run artefacts", icon: FileJson },
+  { key: "csv", label: "CSV", hint: "KPI values", icon: Table2 },
+  { key: "xlsx", label: "Excel", hint: "Multi-sheet workbook", icon: FileSpreadsheet },
+  { key: "pdf", label: "PDF", hint: "Report with methodology", icon: FileText },
+] as const;
 
 export default function SettingsPage() {
   const { id } = useParams<{ id: string }>();
   const router = useRouter();
   const queryClient = useQueryClient();
+  const [confirming, setConfirming] = useState(false);
+
   const project = useQuery({ queryKey: ["project", id], queryFn: () => api.project(id) });
   const remove = useMutation({
     mutationFn: () => api.deleteProject(id),
@@ -20,25 +33,71 @@ export default function SettingsPage() {
   });
 
   return (
-    <div className="space-y-4">
+    <div className="max-w-3xl space-y-4">
       <Card>
-        <h2 className="text-sm font-semibold">Exports</h2>
-        <p className="mt-1 text-sm text-slate-400">Download computed KPIs, insights and methodology. Values come from the latest pipeline run.</p>
-        <div className="mt-3 flex flex-wrap gap-2">
-          {(["json", "csv", "xlsx", "pdf"] as const).map((format) => (
-            <a key={format} href={api.exportUrl(id, format)}>
-              <Button variant="secondary">Export {format.toUpperCase()}</Button>
-            </a>
-          ))}
+        <CardHeader
+          title="Export"
+          subtitle="Values come from the latest pipeline run, with the formula and SQL behind each one."
+        />
+        <div className="grid gap-3 sm:grid-cols-2">
+          {FORMATS.map((format) => {
+            const Icon = format.icon;
+            return (
+              <a
+                key={format.key}
+                href={api.exportUrl(id, format.key)}
+                className="flex items-center gap-3 rounded-xl border border-line bg-surface-muted/60 p-3.5 transition-colors hover:border-brand/30 hover:bg-brand-soft/40"
+              >
+                <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-surface text-brand shadow-card">
+                  <Icon className="size-4" aria-hidden />
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="block text-[0.8125rem] font-medium text-ink">{format.label}</span>
+                  <span className="block text-xs text-ink-muted">{format.hint}</span>
+                </span>
+                <Download className="size-3.5 shrink-0 text-ink-faint" aria-hidden />
+              </a>
+            );
+          })}
         </div>
       </Card>
+
       <Card>
-        <h2 className="text-sm font-semibold">Project</h2>
-        <p className="mt-2 text-sm text-slate-400">ID: {project.data?.id}</p>
-        <p className="text-sm text-slate-400">Domain: {project.data?.domain}</p>
-        <Button className="mt-4" variant="destructive" onClick={() => remove.mutate()}>
-          Delete project
-        </Button>
+        <CardHeader title="Project" />
+        <dl className="grid gap-4 sm:grid-cols-2">
+          <Field label="Name">{project.data?.name ?? "—"}</Field>
+          <Field label="Domain">{project.data?.domain ?? "—"}</Field>
+          <Field label="Status">{project.data?.status.replace(/_/g, " ") ?? "—"}</Field>
+          <Field label="Project ID">
+            <span className="font-mono text-[0.6875rem]">{project.data?.id}</span>
+          </Field>
+        </dl>
+      </Card>
+
+      <Card className="border-bad/15">
+        <CardHeader
+          title="Delete project"
+          subtitle="Removes the project, its datasets and every artefact from all its runs. This cannot be undone."
+        />
+        {confirming ? (
+          <div className="flex flex-wrap items-center gap-2">
+            <Button variant="danger" onClick={() => remove.mutate()} disabled={remove.isPending}>
+              <Trash2 aria-hidden />
+              {remove.isPending ? "Deleting…" : "Yes, delete permanently"}
+            </Button>
+            <Button variant="secondary" onClick={() => setConfirming(false)}>
+              Cancel
+            </Button>
+          </div>
+        ) : (
+          <Button variant="danger" onClick={() => setConfirming(true)}>
+            <Trash2 aria-hidden />
+            Delete project
+          </Button>
+        )}
+        {remove.error && (
+          <p className="mt-2.5 text-[0.8125rem] text-bad">{(remove.error as Error).message}</p>
+        )}
       </Card>
     </div>
   );

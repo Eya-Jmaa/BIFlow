@@ -76,77 +76,120 @@ anomaly tests and seasonality, and drawn hollow on the chart.
 additive, semi-additive or non-additive. "The UK is 85% of revenue" is a valid statement;
 "Singapore is 48% of average unit price" is not, and is never generated.
 
-## Quick start
+## Running it
 
-### Docker (full stack)
+You need **Python 3.11+** and **Node 20+**. PostgreSQL, Redis and Docker are all
+optional — the schema runs on SQLite and the event bus falls back to an in-process
+buffer, so the whole pipeline works on a laptop with nothing else installed.
+
+### Option A — no Docker (fastest)
+
+Two terminals.
+
+**Terminal 1 — API**
+
+```bash
+cd backend
+python -m venv .venv
+.venv\Scripts\activate             # Windows
+# source .venv/bin/activate        # macOS / Linux
+pip install -r requirements.txt
+
+# SQLite keeps everything in one file; delete it to start clean.
+DATABASE_URL="sqlite:///./biflow.db" uvicorn app.main:app --reload --port 8000
+```
+
+On Windows PowerShell, set the variable first:
+
+```powershell
+$env:DATABASE_URL = "sqlite:///./biflow.db"
+uvicorn app.main:app --reload --port 8000
+```
+
+**Terminal 2 — web app**
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Open <http://localhost:3000>. API docs are at <http://localhost:8000/docs>.
+
+### Option B — Docker (Postgres + Redis + worker)
 
 ```bash
 cp .env.example .env
 docker compose up --build
 ```
 
-Then open <http://localhost:3000>. API docs at <http://localhost:8000/docs>.
+Same URLs. Use this when you want the queue and the multi-process event stream.
 
-### Without Docker
+### First run
 
-PostgreSQL and Redis are optional. The schema runs on SQLite, and the event bus falls
-back to an in-process buffer, so the whole pipeline can be demonstrated on a laptop:
+1. Get the demo dataset: `python scripts/download_demo_data.py`
+   (or bring any CSV, Parquet or Excel file).
+2. Create a project on the home page — the default objective is already filled in.
+3. Open **Datasets**, drop the file in.
+4. Click **Run pipeline** in the header. It takes about 8 seconds on the 541k-row
+   UCI file; the Pipeline screen shows each agent as it completes.
+5. Work through Data Quality → Semantic Model → KPIs → Dashboard → Insights → Audit.
 
-```bash
-cd backend
-python -m venv .venv && .venv/Scripts/activate      # Windows
-pip install -r requirements.txt
-DATABASE_URL="sqlite:///./biflow.db" uvicorn app.main:app --port 8000
-
-cd ../frontend
-npm install && npm run dev
-```
-
-## Demo
+### Tests
 
 ```bash
-python scripts/download_demo_data.py    # fetches UCI Online Retail
+cd backend && pytest -q          # 99 tests
+cd frontend && npx tsc --noEmit  # type check
 ```
 
-1. Create a project, for example **E-Commerce BI Analysis**.
-2. Set the objective: *Analyse e-commerce sales performance, customer behaviour, product
-   mix and revenue evolution across countries.*
-3. Upload the dataset and click **Run pipeline**.
-4. Watch the agents complete on the Pipeline screen, then work through Data Quality,
-   Semantic Model, KPIs, Insights, Dashboard, Audit/XAI and Lineage.
-5. On the Dashboard, filter by period and country — every tile re-queries the same slice —
-   and use **Explore** on any metric to break it down and read the SQL that produced it.
+### Troubleshooting
 
-On the real UCI file (541,909 rows) the run takes about 8 seconds and produces 14 KPIs.
-The headline figures are pinned in `tests/test_real_dataset.py`:
+| Symptom | Cause |
+| --- | --- |
+| "Cannot reach the API" in the browser | The backend is not running, or not on port 8000. `NEXT_PUBLIC_API_URL` overrides the default. |
+| `redis_unavailable_using_memory_events` in the log | Expected without Redis. Events fall back to an in-process buffer; the pipeline is unaffected. |
+| Pipeline finishes but the dashboard is empty | The run produced no computed KPIs — check **Audit / XAI** for the verdict and its reasoning. |
+| "LLM interpretation is off" at startup | `LLM_PROVIDER` does not match the API key you set. The message names the fix. Deterministic output is unaffected. |
+
+## What it produces
+
+On the real UCI Online Retail file (541,909 rows) a run takes about 8 seconds and
+produces 14 KPIs. These figures were computed independently of the pipeline and are
+asserted in `backend/tests/test_real_dataset.py`:
 
 | KPI | Value |
 | --- | --- |
 | Net Revenue | 9,747,747.93 |
 | Gross Revenue | 10,644,560.42 |
-| Returned Value | −896,812.49 |
+| Returned Value | -896,812.49 |
 | Orders | 22,064 |
 | Cancelled Orders | 3,836 |
 | Unique Customers | 4,372 |
 | Average Order Value | 482.44 |
 
-A second, unrelated schema runs through the same agents without code changes.
+Gross + Returned = Net exactly, and Orders + Cancelled Orders = the 25,900 distinct
+documents in the file. Those identities are the point: the numbers reconcile rather than
+being independent guesses.
 
-## Tests
+A second, unrelated schema runs through the same agents with no code changes. Where no
+business role matches, the catalog falls back to plainly labelled sums and averages
+instead of dressing them up as revenue.
 
-```bash
-cd backend && pytest -q
-```
+[docs/demo.md](docs/demo.md) is a ten-minute walkthrough that shows the agents
+disagreeing, not just the output.
 
-95 tests. They cover date-format resolution and the value-loss guards, the formula
-grammar and its rejection of invented columns and injected SQL, additivity
-classification, KPI catalog reconciliation (gross − returns = net), partial-period
-handling, insight ranking, the read-only SQL validator, LLM output grounding, and the
-agent graph end to end — including that the auditor's feedback edge fires, that the retry
-budget terminates it, and that re-running an agent does not duplicate its artefacts.
+### What the tests cover
 
-`tests/test_real_dataset.py` asserts the exact figures above against the real UCI file and
-skips when it is absent.
+99 tests: date-format resolution and the value-loss guards, the formula grammar and its
+rejection of invented columns and injected SQL, additivity classification, KPI catalog
+reconciliation, partial-period handling, insight ranking, the read-only SQL validator,
+LLM output grounding, agent evaluation metrics, and the agent graph end to end —
+including that the auditor's feedback edge fires, that the retry budget terminates it,
+and that re-running an agent does not duplicate its artefacts.
+
+`tests/test_real_dataset.py` asserts the figures above against the real file and skips
+when it is absent, so a green suite does not by itself prove they still hold — check it
+did not skip.
 
 ## Configuration
 

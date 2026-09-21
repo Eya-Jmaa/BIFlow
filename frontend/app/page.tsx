@@ -1,93 +1,203 @@
 "use client";
 
-import { api, type Project } from "@/lib/api";
+import { useState } from "react";
+import Link from "next/link";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ArrowRight, FolderPlus, Plus, Sparkles } from "lucide-react";
+
 import { Badge, statusTone } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import Link from "next/link";
-import { useState } from "react";
+import { Card, CardHeader } from "@/components/ui/card";
+import { EmptyState, Skeleton } from "@/components/ui/data";
+import { api, type Project } from "@/lib/api";
+
+const DOMAINS = [
+  "ecommerce",
+  "retail",
+  "finance",
+  "banking",
+  "telecommunications",
+  "transport",
+  "health",
+  "marketing",
+  "general",
+];
+
+const PIPELINE = [
+  "Profile",
+  "Clean",
+  "Model",
+  "Measure",
+  "Analyse",
+  "Visualise",
+  "Audit",
+];
 
 export default function HomePage() {
   const queryClient = useQueryClient();
   const projects = useQuery({ queryKey: ["projects"], queryFn: api.projects });
   const [name, setName] = useState("E-Commerce BI Analysis");
   const [objective, setObjective] = useState(
-    "Analyze e-commerce sales performance, customer behavior, delivery performance and revenue evolution.",
+    "Analyse e-commerce sales performance, customer behaviour, product mix and revenue evolution across countries.",
   );
   const [domain, setDomain] = useState("ecommerce");
+
   const create = useMutation({
     mutationFn: () => api.createProject({ name, business_objective: objective, domain }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["projects"] }),
   });
 
   return (
-    <div className="min-h-screen bg-[#070b14] text-slate-100">
-      <header className="border-b border-slate-800 px-6 py-4">
-        <p className="text-xs uppercase tracking-[0.2em] text-slate-500">BIFlow</p>
-        <h1 className="mt-1 text-xl font-semibold">Autonomous multi-agent business intelligence</h1>
-        <p className="mt-1 max-w-3xl text-sm text-slate-400">
-          Give BIFlow your real data and business objective. The platform profiles, cleans, models, analyzes and explains it.
+    <div className="mx-auto max-w-6xl px-5 py-10 lg:px-8 lg:py-14">
+      <header className="mb-10">
+        <span className="inline-flex items-center gap-1.5 rounded-full bg-brand-soft px-3 py-1 text-[0.6875rem] font-medium text-brand-strong ring-1 ring-brand/15 ring-inset">
+          <Sparkles className="size-3" aria-hidden />
+          Multi-agent business intelligence
+        </span>
+        <h1 className="mt-4 max-w-2xl text-[2rem] leading-tight font-semibold tracking-tight text-ink lg:text-[2.5rem]">
+          From a raw file to an audited dashboard.
+        </h1>
+        <p className="mt-3 max-w-2xl text-[0.9375rem] leading-relaxed text-ink-soft">
+          Give BIFlow a dataset and a business objective. Seven agents profile the data, fix what
+          they can, infer a semantic model, compute a KPI catalog, analyse the results and explain
+          every number back to the SQL that produced it.
         </p>
+        <ol className="mt-6 flex flex-wrap items-center gap-x-1.5 gap-y-2">
+          {PIPELINE.map((step, index) => (
+            <li key={step} className="flex items-center gap-1.5">
+              <span className="rounded-lg bg-surface px-2.5 py-1 text-xs font-medium text-ink-soft shadow-card ring-1 ring-line ring-inset">
+                {step}
+              </span>
+              {index < PIPELINE.length - 1 && (
+                <ArrowRight className="size-3 text-ink-faint" aria-hidden />
+              )}
+            </li>
+          ))}
+        </ol>
       </header>
-      <main className="mx-auto grid max-w-6xl gap-6 px-6 py-8 lg:grid-cols-[1.1fr_0.9fr]">
-        <section className="space-y-3">
-          <h2 className="text-sm font-semibold text-slate-200">Projects</h2>
-          {projects.isLoading && <p className="text-sm text-slate-500">Loading projects…</p>}
-          {projects.error && <p className="text-sm text-red-400">{(projects.error as Error).message}</p>}
-          {projects.data?.length === 0 && <p className="text-sm text-slate-500">No projects yet. Create one to start.</p>}
-          <div className="space-y-2">
+
+      <div className="grid items-start gap-6 lg:grid-cols-[1.15fr_0.85fr]">
+        <section>
+          <div className="mb-3 flex items-center justify-between">
+            <h2 className="text-sm font-semibold tracking-tight text-ink">Projects</h2>
+            {projects.data && projects.data.length > 0 && (
+              <span className="text-xs text-ink-faint">{projects.data.length} total</span>
+            )}
+          </div>
+
+          {projects.isLoading && (
+            <div className="space-y-2.5">
+              {[0, 1, 2].map((index) => (
+                <Skeleton key={index} className="h-24 w-full" />
+              ))}
+            </div>
+          )}
+
+          {projects.error && (
+            <EmptyState
+              title="Cannot reach the API"
+              message={(projects.error as Error).message}
+              icon={<FolderPlus className="size-5" />}
+            />
+          )}
+
+          {projects.data?.length === 0 && (
+            <EmptyState
+              title="No projects yet"
+              message="Create one on the right, upload a dataset, then run the pipeline."
+              icon={<FolderPlus className="size-5" />}
+            />
+          )}
+
+          <div className="space-y-2.5">
             {projects.data?.map((project: Project) => (
-              <Link key={project.id} href={`/projects/${project.id}`}>
-                <Card className="transition hover:border-slate-600">
+              <Link key={project.id} href={`/projects/${project.id}`} className="block">
+                <Card interactive className="group">
                   <div className="flex items-start justify-between gap-3">
-                    <div>
-                      <p className="font-medium">{project.name}</p>
-                      <p className="mt-1 line-clamp-2 text-sm text-slate-400">{project.business_objective}</p>
+                    <div className="min-w-0">
+                      <p className="font-medium text-ink">{project.name}</p>
+                      <p className="mt-1 line-clamp-2 text-[0.8125rem] leading-relaxed text-ink-muted">
+                        {project.business_objective}
+                      </p>
+                      <div className="mt-3 flex items-center gap-2">
+                        <Badge tone="neutral">{project.domain}</Badge>
+                        <span className="text-[0.6875rem] text-ink-faint">
+                          {new Date(project.created_at).toLocaleDateString("en-GB", {
+                            day: "numeric",
+                            month: "short",
+                            year: "numeric",
+                          })}
+                        </span>
+                      </div>
                     </div>
-                    <Badge tone={statusTone(project.status)}>{project.status}</Badge>
+                    <div className="flex shrink-0 items-center gap-2">
+                      <Badge tone={statusTone(project.status)} dot>
+                        {project.status.replace(/_/g, " ")}
+                      </Badge>
+                      <ArrowRight
+                        className="size-4 text-ink-faint transition-transform group-hover:translate-x-0.5"
+                        aria-hidden
+                      />
+                    </div>
                   </div>
                 </Card>
               </Link>
             ))}
           </div>
         </section>
-        <Card>
-          <h2 className="text-sm font-semibold">New project</h2>
-          <label className="mt-4 block text-xs text-slate-400">
-            Name
-            <input
-              className="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-            />
-          </label>
-          <label className="mt-3 block text-xs text-slate-400">
-            Domain
-            <select
-              className="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100"
-              value={domain}
-              onChange={(e) => setDomain(e.target.value)}
-            >
-              {["ecommerce", "retail", "finance", "telecommunications", "health", "general"].map((d) => (
-                <option key={d}>{d}</option>
-              ))}
-            </select>
-          </label>
-          <label className="mt-3 block text-xs text-slate-400">
-            Business objective
-            <textarea
-              className="mt-1 min-h-28 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100"
-              value={objective}
-              onChange={(e) => setObjective(e.target.value)}
-            />
-          </label>
-          <Button className="mt-4" onClick={() => create.mutate()} disabled={create.isPending || !name || !objective}>
-            Create project
+
+        <Card className="lg:sticky lg:top-8">
+          <CardHeader title="New project" subtitle="The objective steers domain inference." />
+
+          <div className="space-y-4">
+            <label className="block">
+              <span className="text-[0.8125rem] font-medium text-ink-soft">Name</span>
+              <input
+                className="mt-1.5 w-full rounded-lg border border-line-strong bg-surface px-3 py-2 text-sm text-ink transition-colors placeholder:text-ink-faint focus:border-brand"
+                value={name}
+                onChange={(event) => setName(event.target.value)}
+                placeholder="Q4 revenue review"
+              />
+            </label>
+
+            <label className="block">
+              <span className="text-[0.8125rem] font-medium text-ink-soft">Domain</span>
+              <select
+                className="mt-1.5 w-full rounded-lg border border-line-strong bg-surface px-3 py-2 text-sm text-ink focus:border-brand"
+                value={domain}
+                onChange={(event) => setDomain(event.target.value)}
+              >
+                {DOMAINS.map((item) => (
+                  <option key={item}>{item}</option>
+                ))}
+              </select>
+            </label>
+
+            <label className="block">
+              <span className="text-[0.8125rem] font-medium text-ink-soft">Business objective</span>
+              <textarea
+                className="mt-1.5 min-h-28 w-full resize-y rounded-lg border border-line-strong bg-surface px-3 py-2 text-sm leading-relaxed text-ink transition-colors placeholder:text-ink-faint focus:border-brand"
+                value={objective}
+                onChange={(event) => setObjective(event.target.value)}
+                placeholder="What should this analysis answer?"
+              />
+            </label>
+          </div>
+
+          <Button
+            className="mt-5 w-full"
+            onClick={() => create.mutate()}
+            disabled={create.isPending || !name.trim() || !objective.trim()}
+          >
+            <Plus aria-hidden />
+            {create.isPending ? "Creating…" : "Create project"}
           </Button>
-          {create.error && <p className="mt-2 text-sm text-red-400">{(create.error as Error).message}</p>}
+
+          {create.error && (
+            <p className="mt-2.5 text-[0.8125rem] text-bad">{(create.error as Error).message}</p>
+          )}
         </Card>
-      </main>
+      </div>
     </div>
   );
 }

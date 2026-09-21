@@ -116,14 +116,3 @@ def event_history(run_id: str, offset: int = 0) -> list[dict[str, Any]]:
             logger.warning("event_history_failed", run_id=run_id, error=str(exc))
     with _lock:
         return list(_fallback.get(run_id, ()))[offset:]
-
-
-def clear_history(run_id: str) -> None:
-    with _lock:
-        _fallback.pop(run_id, None)
-    client = _redis()
-    if client is not None:
-        try:
-            client.delete(f"{CHANNEL_PREFIX}{run_id}:log")
-        except Exception:  # noqa: BLE001
-            pass

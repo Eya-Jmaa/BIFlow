@@ -1,20 +1,25 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+import { Inter } from "next/font/google";
+
 import { Providers } from "@/components/providers";
 import "./globals.css";
 
-const geistSans = Geist({ variable: "--font-geist-sans", subsets: ["latin"] });
-const geistMono = Geist_Mono({ variable: "--font-geist-mono", subsets: ["latin"] });
+const inter = Inter({
+  variable: "--font-sans",
+  subsets: ["latin"],
+  display: "swap",
+});
 
 export const metadata: Metadata = {
-  title: "BIFlow",
-  description: "Autonomous multi-agent business intelligence platform",
+  title: "BIFlow — Multi-agent BI",
+  description:
+    "Raw data to an audited dashboard: seven agents profile, clean, model, measure, analyse and explain.",
 };
 
-export default function RootLayout({ children }: LayoutProps<"/">) {
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en" className={`dark ${geistSans.variable} ${geistMono.variable} h-full`}>
-      <body className="min-h-full bg-[#070b14] font-sans text-slate-100 antialiased">
+    <html lang="en" className={`${inter.variable} h-full`}>
+      <body className="app-canvas min-h-full font-sans">
         <Providers>{children}</Providers>
       </body>
     </html>

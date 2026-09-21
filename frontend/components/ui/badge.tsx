@@ -1,41 +1,56 @@
 import { cn } from "@/lib/utils";
 
-const tones: Record<string, string> = {
-  success: "bg-emerald-950 text-emerald-300 border-emerald-800",
-  warning: "bg-amber-950 text-amber-300 border-amber-800",
-  error: "bg-red-950 text-red-300 border-red-800",
-  info: "bg-slate-800 text-slate-200 border-slate-700",
-  running: "bg-blue-950 text-blue-300 border-blue-800",
-};
+/**
+ * Status pills.
+ *
+ * Status colours are reserved for state and never reused as a chart series
+ * colour, and each pill carries its own text — colour never has to be read on
+ * its own.
+ */
+const tones = {
+  success: "bg-good-soft text-good ring-good/20",
+  warning: "bg-warn-soft text-warn ring-warn/20",
+  error: "bg-bad-soft text-bad ring-bad/20",
+  brand: "bg-brand-soft text-brand-strong ring-brand/20",
+  neutral: "bg-surface-sunken text-ink-soft ring-line-strong/60",
+} as const;
+
+export type Tone = keyof typeof tones;
 
 export function Badge({
   children,
-  tone = "info",
+  tone = "neutral",
+  dot,
   className,
 }: {
   children: React.ReactNode;
-  tone?: keyof typeof tones | string;
+  tone?: Tone | string;
+  dot?: boolean;
   className?: string;
 }) {
+  const key = (tone in tones ? tone : "neutral") as Tone;
   return (
     <span
       className={cn(
-        "inline-flex items-center rounded border px-1.5 py-0.5 text-[11px] font-medium uppercase tracking-wide",
-        tones[tone] || tones.info,
-        tone === "running" && "animate-pulse",
+        "inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[0.6875rem] font-medium ring-1 ring-inset",
+        tones[key],
         className,
       )}
     >
+      {dot && <span className="size-1.5 rounded-full bg-current" aria-hidden />}
       {children}
     </span>
   );
 }
 
-export function statusTone(status: string): string {
-  const value = status.toLowerCase();
-  if (["completed", "computed", "valid", "ready", "published"].includes(value)) return "success";
-  if (["running", "queued", "pending"].includes(value)) return "running";
-  if (["failed", "invalid", "error"].includes(value)) return "error";
-  if (["warning", "open"].includes(value)) return "warning";
-  return "info";
+/** Maps a backend status string onto a tone. */
+export function statusTone(status: string | null | undefined): Tone {
+  const value = (status || "").toLowerCase();
+  if (["completed", "computed", "valid", "ready", "published", "low", "ok"].includes(value)) {
+    return "success";
+  }
+  if (["running", "queued", "pending", "in_progress"].includes(value)) return "brand";
+  if (["failed", "invalid", "error", "high", "critical", "rejected"].includes(value)) return "error";
+  if (["warning", "open", "medium", "audited_with_issues"].includes(value)) return "warning";
+  return "neutral";
 }
