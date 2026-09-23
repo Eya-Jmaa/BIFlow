@@ -311,6 +311,8 @@ def upgrade() -> None:
         sa.Column("confidence", sa.Float(), server_default="0"),
         sa.Column("query_sql", sa.Text()),
         sa.Column("grounded", sa.Boolean(), server_default=sa.true()),
+        sa.Column("recommendation", sa.Text()),
+        sa.Column("recommendation_basis", sa.String(120)),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
     )

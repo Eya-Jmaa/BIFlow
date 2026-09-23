@@ -17,10 +17,15 @@ import { LayoutDashboard, X } from "lucide-react";
 import { DashboardFilters, EMPTY_FILTERS, buildFilters } from "@/components/dashboard-filters";
 import type { FilterState } from "@/components/dashboard-filters";
 import { WidgetView } from "@/components/widget-view";
-import { Badge, statusTone } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
-import { EmptyState, Skeleton } from "@/components/ui/data";
+import {
+  Badge,
+  Button,
+  EmptyState,
+  Panel,
+  PanelHeader,
+  Skeleton,
+  statusTone,
+} from "@/components/ui/primitives";
 import { api } from "@/lib/api";
 import type { Widget } from "@/lib/api";
 import { CHROME, SERIES, formatValue } from "@/lib/viz";
@@ -259,7 +264,7 @@ function DrillPanel({
   const nonAdditive = query.data?.additivity !== "additive";
 
   return (
-    <Card>
+    <Panel>
       <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
           <p className="text-[0.9375rem] font-semibold tracking-tight text-ink">
@@ -377,12 +382,12 @@ function DrillPanel({
             <summary className="cursor-pointer text-[0.6875rem] font-semibold tracking-wider text-ink-faint uppercase transition-colors hover:text-ink-muted">
               SQL executed
             </summary>
-            <pre className="mt-2 overflow-auto rounded-lg border border-line bg-surface-sunken p-3 font-mono text-[0.6875rem] leading-relaxed text-ink-soft">
+            <pre className="mt-2 overflow-auto rounded-lg border border-line bg-inset p-3 font-mono text-[0.6875rem] leading-relaxed text-ink-soft">
               {query.data?.sql}
             </pre>
           </details>
         </div>
       )}
-    </Card>
+    </Panel>
   );
 }

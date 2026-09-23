@@ -155,6 +155,48 @@ seasonality, and named in the insight text.
 Insights are scored by category, severity, confidence and effect size, capped per metric
 and de-duplicated, because sixty mechanical observations are not an analysis.
 
+## Frontend
+
+One design system, applied everywhere. `app/globals.css` defines the token set
+(surfaces, ink, lines, brand, status, chart slots, radii, elevation, motion) and
+`components/ui/primitives.tsx` is the only place a surface, badge, button, table
+or state component is styled. Pages compose; they do not re-style.
+
+**Two themes, both selected.** Dark mode redefines every token rather than
+inverting the light theme, including chart slots re-stepped for the dark
+surface and validated against it. A tiny inline script stamps the theme class
+before first paint, so the page never flashes the wrong theme.
+
+**Routes follow the pipeline.** Each stage is its own screen, numbered in
+execution order, and `lib/pipeline.ts` is the single definition the hero graph,
+the sidebar, the project cards and the stepper all read from:
+
+| Route | Stage | Backend agent |
+| --- | --- | --- |
+| `/profile` | 01 Profile | `profiler` |
+| `/clean` | 02 Clean | `quality` |
+| `/model` | 03 Model | `semantic` |
+| `/measures` | 04 Measure | `semantic` |
+| `/analyze` | 05 Analyze | `analyst` |
+| `/visualize` | 06 Visualize | `dashboard` |
+| `/audit` | 07 Audit | `auditor` |
+
+Model and Measure share the `semantic` agent, so the mapping is explicit rather
+than inferred — a stage reporting "complete" when nothing ran is the worst kind
+of error in a tool whose whole claim is traceability.
+
+**Everything on screen is backed by a record.** Stage metrics come from each
+agent's own `output_summary`; the domain preview on the New Project form calls
+`POST /api/domains/infer`, which runs the very same `infer_domain` the
+orchestrator runs. Where a capability does not exist — live database connectors,
+for instance — the UI says so rather than mocking it.
+
+**Motion has a job.** Durations come from three tokens (fast 160ms for hover and
+press, base 280ms for panels and tabs, slow 420ms for drawers and routes).
+Particles animate only along pipeline edges that actually carried data, and a
+status dot pulses only while its agent is genuinely running. One media query
+disables every decorative animation for `prefers-reduced-motion`.
+
 ## Interactive queries
 
 `POST /api/projects/{id}/query` recompiles the stored formula and appends predicates built

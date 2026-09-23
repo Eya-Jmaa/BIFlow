@@ -1,51 +1,55 @@
 @import "tailwindcss";
 
 /*
-  BIFlow design tokens.
+  BIFlow design system
+  ────────────────────
+  One token set, two themes. The dark theme is *selected*, not an automatic
+  inversion: its chart slots were re-stepped for the dark surface and validated
+  against it, because a palette that passes on white routinely fails on near-black.
 
-  One light theme, deliberately: a second theme that is an automatic inversion
-  of the first is worse than none, and the chart palette below was validated
-  against this surface specifically.
-
-  The chart slots are a validated categorical set — fixed order, never cycled,
-  never reassigned by rank. Slots 3 and 4 fall below 3:1 against white, which
-  is allowed only because every chart in the app also ships a table view.
+  Chart slots are a validated categorical set — fixed order, never cycled, never
+  reassigned by rank. On light, slots 3 and 4 fall below 3:1 against the surface;
+  that is permitted only because every chart in the app also ships a table view.
 */
 
 @theme {
-  /* Surfaces */
-  --color-canvas: #f4f5fb;
+  /* ── Surfaces ───────────────────────────────────────────────── */
+  --color-canvas: #f6f7fb;
   --color-surface: #ffffff;
-  --color-surface-muted: #f8f9fd;
-  --color-surface-sunken: #eef0f9;
-  --color-shell: #14162b;
-  --color-shell-muted: #1e2138;
+  --color-raised: #ffffff;
+  --color-sunken: #f1f3f9;
+  --color-inset: #eaedf6;
+  --color-shell: #0e1018;
+  --color-shell-raised: #171a25;
 
-  /* Ink */
-  --color-ink: #12142a;
-  --color-ink-soft: #4a4f6b;
-  --color-ink-muted: #7c81a0;
-  --color-ink-faint: #a5a9c2;
+  /* ── Ink ────────────────────────────────────────────────────── */
+  --color-ink: #0d1020;
+  --color-ink-soft: #414863;
+  --color-ink-muted: #6d7593;
+  --color-ink-faint: #99a0b8;
 
-  /* Lines */
-  --color-line: #e6e8f4;
-  --color-line-strong: #d3d7ea;
+  /* ── Lines ──────────────────────────────────────────────────── */
+  --color-line: #e7e9f2;
+  --color-line-strong: #d4d8e6;
 
-  /* Brand */
-  --color-brand: #5b5bf0;
-  --color-brand-strong: #4a46d8;
-  --color-brand-soft: #eceafe;
-  --color-accent: #b06ef5;
+  /* ── Brand ──────────────────────────────────────────────────── */
+  --color-brand: #4f46e5;
+  --color-brand-strong: #4338ca;
+  --color-brand-soft: #eef0fe;
+  --color-brand-line: #c9cdfa;
+  --color-accent: #7c5cf5;
 
-  /* Status — reserved, never reused as a series colour */
-  --color-good: #12a150;
-  --color-warn: #d98500;
-  --color-bad: #d93b4b;
-  --color-good-soft: #e6f7ee;
-  --color-warn-soft: #fdf3e2;
-  --color-bad-soft: #fdecee;
+  /* ── Status (reserved — never a series colour) ──────────────── */
+  --color-good: #0f9d58;
+  --color-warn: #c77700;
+  --color-bad: #d03544;
+  --color-info: #2a78d6;
+  --color-good-soft: #e6f6ed;
+  --color-warn-soft: #fdf4e3;
+  --color-bad-soft: #fdeced;
+  --color-info-soft: #e9f1fc;
 
-  /* Validated categorical chart slots (light surface) */
+  /* ── Validated categorical chart slots (light surface) ──────── */
   --color-series-1: #2a78d6;
   --color-series-2: #eb6834;
   --color-series-3: #1baf7a;
@@ -55,11 +59,82 @@
   --color-series-7: #4a3aa7;
   --color-series-8: #e34948;
 
-  --radius-card: 1rem;
+  /* ── Chart chrome ───────────────────────────────────────────── */
+  --color-grid: #edf0f7;
+  --color-axis: #dfe3ee;
 
-  --shadow-card: 0 1px 2px rgb(18 20 42 / 0.04), 0 8px 24px -12px rgb(18 20 42 / 0.12);
-  --shadow-lift: 0 2px 4px rgb(18 20 42 / 0.05), 0 16px 40px -16px rgb(18 20 42 / 0.2);
-  --shadow-shell: 0 12px 40px -12px rgb(18 20 42 / 0.35);
+  /* ── Radius ─────────────────────────────────────────────────── */
+  --radius-card: 0.875rem;
+  --radius-panel: 1.125rem;
+
+  /* ── Elevation ──────────────────────────────────────────────── */
+  --shadow-card: 0 1px 2px rgb(13 16 32 / 0.04), 0 6px 20px -12px rgb(13 16 32 / 0.14);
+  --shadow-lift: 0 2px 4px rgb(13 16 32 / 0.05), 0 18px 44px -20px rgb(13 16 32 / 0.26);
+  --shadow-float: 0 24px 60px -24px rgb(13 16 32 / 0.34);
+  --shadow-shell: 0 16px 48px -16px rgb(13 16 32 / 0.4);
+
+  /* ── Motion ─────────────────────────────────────────────────── */
+  /* Fast: hover, press. Base: panels, tabs. Slow: route, drawer. */
+  --ease-out-soft: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-in-out-soft: cubic-bezier(0.65, 0, 0.35, 1);
+  --duration-fast: 160ms;
+  --duration-base: 280ms;
+  --duration-slow: 420ms;
+}
+
+/*
+  Dark theme. Applied by adding `.dark` to <html>, which the theme script does
+  before first paint so there is no flash.
+*/
+.dark {
+  --color-canvas: #090b11;
+  --color-surface: #0f1117;
+  --color-raised: #161923;
+  --color-sunken: #14161f;
+  --color-inset: #1b1f2b;
+  --color-shell: #0c0e14;
+  --color-shell-raised: #161923;
+
+  --color-ink: #eef0f7;
+  --color-ink-soft: #b3b9cc;
+  --color-ink-muted: #858da6;
+  --color-ink-faint: #656d87;
+
+  --color-line: #232735;
+  --color-line-strong: #333949;
+
+  --color-brand: #6d64f0;
+  --color-brand-strong: #8179f5;
+  --color-brand-soft: #1a1b35;
+  --color-brand-line: #35356b;
+  --color-accent: #9b82f8;
+
+  --color-good: #3dbd77;
+  --color-warn: #e0a02a;
+  --color-bad: #f0616f;
+  --color-info: #5b9ceb;
+  --color-good-soft: #10241a;
+  --color-warn-soft: #251c0d;
+  --color-bad-soft: #2a1317;
+  --color-info-soft: #101c2c;
+
+  /* Re-stepped for the dark surface, then validated against it. */
+  --color-series-1: #3987e5;
+  --color-series-2: #d95926;
+  --color-series-3: #199e70;
+  --color-series-4: #c98500;
+  --color-series-5: #d55181;
+  --color-series-6: #008300;
+  --color-series-7: #9085e9;
+  --color-series-8: #e66767;
+
+  --color-grid: #1c202b;
+  --color-axis: #2b3040;
+
+  --shadow-card: 0 1px 2px rgb(0 0 0 / 0.3), 0 6px 20px -12px rgb(0 0 0 / 0.5);
+  --shadow-lift: 0 2px 4px rgb(0 0 0 / 0.35), 0 18px 44px -20px rgb(0 0 0 / 0.65);
+  --shadow-float: 0 24px 60px -24px rgb(0 0 0 / 0.75);
+  --shadow-shell: 0 16px 48px -16px rgb(0 0 0 / 0.6);
 }
 
 html,
@@ -71,14 +146,28 @@ body {
   background-color: var(--color-canvas);
   color: var(--color-ink);
   -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
-/* A quiet wash so the canvas reads as depth rather than flat grey. */
+/*
+  Canvas treatment: a fine measurement grid plus two very low-intensity washes.
+  It reads as graph paper under the content rather than decoration — the data
+  is the hero, so this stays close to invisible.
+*/
 .app-canvas {
   background-image:
-    radial-gradient(60rem 40rem at 12% -10%, #e7e6fe 0%, transparent 60%),
-    radial-gradient(50rem 36rem at 95% 0%, #e4effe 0%, transparent 55%);
+    linear-gradient(to right, color-mix(in oklab, var(--color-line) 55%, transparent) 1px, transparent 1px),
+    linear-gradient(to bottom, color-mix(in oklab, var(--color-line) 55%, transparent) 1px, transparent 1px),
+    radial-gradient(48rem 30rem at 8% -8%, color-mix(in oklab, var(--color-brand) 9%, transparent) 0%, transparent 62%),
+    radial-gradient(42rem 28rem at 96% -4%, color-mix(in oklab, var(--color-info) 8%, transparent) 0%, transparent 58%);
+  background-size: 64px 64px, 64px 64px, 100% 100%, 100% 100%;
   background-attachment: fixed;
+}
+
+/* Tabular figures wherever numbers stack vertically. */
+.tnum {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
 }
 
 *:focus-visible {
@@ -87,28 +176,134 @@ body {
   border-radius: 4px;
 }
 
-/* Scrollbars, so an inner scroll area does not look like a rendering bug. */
 * {
   scrollbar-width: thin;
   scrollbar-color: var(--color-line-strong) transparent;
 }
 *::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 9px;
+  height: 9px;
 }
 *::-webkit-scrollbar-thumb {
   background-color: var(--color-line-strong);
   border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
 }
 *::-webkit-scrollbar-track {
   background: transparent;
 }
 
+/* ── Motion primitives ────────────────────────────────────────── */
+
+@keyframes bf-fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes bf-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes bf-scale-in {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes bf-slide-left {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: none;
+  }
+}
+/* A status dot for work in progress: a soft halo, not a strobe. */
+@keyframes bf-pulse-ring {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in oklab, currentColor 45%, transparent);
+  }
+  70% {
+    box-shadow: 0 0 0 5px color-mix(in oklab, currentColor 0%, transparent);
+  }
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in oklab, currentColor 0%, transparent);
+  }
+}
+/* Particles travelling an edge of the pipeline graph. */
+@keyframes bf-flow {
+  from {
+    stroke-dashoffset: var(--flow-length, 24);
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+@keyframes bf-shimmer {
+  from {
+    background-position: -200% 0;
+  }
+  to {
+    background-position: 200% 0;
+  }
+}
+
+.bf-fade-up {
+  animation: bf-fade-up var(--duration-base) var(--ease-out-soft) both;
+}
+.bf-fade {
+  animation: bf-fade var(--duration-base) var(--ease-out-soft) both;
+}
+.bf-scale-in {
+  animation: bf-scale-in var(--duration-fast) var(--ease-out-soft) both;
+}
+.bf-slide-left {
+  animation: bf-slide-left var(--duration-slow) var(--ease-out-soft) both;
+}
+.bf-pulse {
+  animation: bf-pulse-ring 2s var(--ease-in-out-soft) infinite;
+}
+
+/* Skeletons: a slow sweep, never a blink. */
+.bf-skeleton {
+  background-image: linear-gradient(
+    90deg,
+    var(--color-sunken) 25%,
+    color-mix(in oklab, var(--color-sunken) 55%, var(--color-surface)) 50%,
+    var(--color-sunken) 75%
+  );
+  background-size: 200% 100%;
+  animation: bf-shimmer 1.8s linear infinite;
+}
+
+/*
+  One switch disables every decorative animation. Progress and status still
+  change, they just stop moving.
+*/
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
   *::after {
     animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+  .app-canvas {
+    background-attachment: scroll;
   }
 }

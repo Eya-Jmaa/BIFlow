@@ -3,8 +3,16 @@
 import { useMemo, useState } from "react";
 import { Calendar, Check, ChevronDown, Filter, Loader2, X } from "lucide-react";
 
-import { Toggle } from "@/components/ui/button";
 import type { DashboardFilter, FilterDimension } from "@/lib/api";
+import {
+  Badge,
+  DataTable,
+  Panel,
+  Segment,
+  SegmentGroup,
+  Td,
+  Tr,
+} from "@/components/ui/primitives";
 import { cn } from "@/lib/utils";
 
 /**
@@ -120,16 +128,16 @@ export function DashboardFilters({
         {dateDimension && (
           <div className="flex items-center gap-2">
             <Calendar className="size-3.5 shrink-0 text-ink-faint" aria-hidden />
-            <div className="flex rounded-lg bg-surface-sunken p-0.5">
+            <div className="flex rounded-lg bg-inset p-0.5">
               {PRESETS.map((preset) => (
-                <Toggle
+                <Segment
                   key={preset.label}
                   active={activePreset === preset.label}
                   onClick={() => applyPreset(preset.months)}
                 >
                   {activePreset === preset.label && <Check className="size-3" aria-hidden />}
                   {preset.label}
-                </Toggle>
+                </Segment>
               ))}
             </div>
           </div>
@@ -174,7 +182,7 @@ export function DashboardFilters({
                 "inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs transition-colors",
                 state.values.length
                   ? "border-brand/25 bg-brand-soft text-brand-strong"
-                  : "border-line-strong text-ink-muted hover:bg-surface-muted",
+                  : "border-line-strong text-ink-muted hover:bg-sunken",
               )}
             >
               {state.values.length ? `${state.values.length} selected` : "All values"}
@@ -221,7 +229,7 @@ export function DashboardFilters({
                     "inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs transition-colors",
                     selected
                       ? "bg-brand text-white"
-                      : "bg-surface-sunken text-ink-soft hover:bg-line",
+                      : "bg-inset text-ink-soft hover:bg-line",
                   )}
                 >
                   {selected && <Check className="size-3" aria-hidden />}

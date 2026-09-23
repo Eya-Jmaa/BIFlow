@@ -99,6 +99,8 @@ class InsightOut(BaseModel):
     confidence: float
     query_sql: str | None
     grounded: bool
+    recommendation: str | None
+    recommendation_basis: str | None
 
     model_config = {"from_attributes": True}
 

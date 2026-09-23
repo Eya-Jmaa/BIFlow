@@ -38,3 +38,8 @@ class Insight(TimestampMixin, Base):
     confidence: Mapped[float] = mapped_column(Float, default=0.0)
     query_sql: Mapped[str | None] = mapped_column(Text, nullable=True)
     grounded: Mapped[bool] = mapped_column(default=True)
+    # What to do about the finding. Derived from the measured condition by a
+    # rule, never free-form advice: a recommendation with no finding behind it
+    # is exactly the kind of confident noise this pipeline exists to avoid.
+    recommendation: Mapped[str | None] = mapped_column(Text, nullable=True)
+    recommendation_basis: Mapped[str | None] = mapped_column(String(120), nullable=True)

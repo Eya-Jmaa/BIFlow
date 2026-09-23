@@ -100,6 +100,10 @@ export type Insight = {
   confidence: number;
   query_sql: string | null;
   grounded: boolean;
+  /** The action the finding implies, derived from a rule. Null when none fired. */
+  recommendation: string | null;
+  /** Which rule produced the recommendation, so the advice is auditable too. */
+  recommendation_basis: string | null;
 };
 
 export type Widget = {
@@ -198,6 +202,17 @@ export type QueryRequest = {
   limit?: number;
 };
 
+
+export type DomainInference = {
+  domain: string;
+  matched_terms: string[];
+  common_dimensions: string[];
+  common_metrics: string[];
+  common_kpis: string[];
+  rules: string[];
+  confident: boolean;
+};
+
 export const api = {
   health: () => request<{ status: string }>("/health"),
   projects: () => request<Project[]>("/api/projects"),
@@ -245,6 +260,11 @@ export const api = {
   lineage: (id: string) => request<unknown>(`/api/projects/${id}/lineage`),
   agentRuns: (id: string) => request<unknown[]>(`/api/projects/${id}/agent-runs`),
   evaluation: (id: string) => request<unknown[]>(`/api/projects/${id}/evaluation`),
+  inferDomain: (objective: string, columns: string[] = []) =>
+    request<DomainInference>("/api/domains/infer", {
+      method: "POST",
+      body: JSON.stringify({ business_objective: objective, columns }),
+    }),
   filterOptions: (id: string) => request<FilterOptions>(`/api/projects/${id}/filter-options`),
   queryKpi: (id: string, body: QueryRequest) =>
     request<QueryResult>(`/api/projects/${id}/query`, { method: "POST", body: JSON.stringify(body) }),

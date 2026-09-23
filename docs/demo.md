@@ -25,20 +25,20 @@ nothing was hard-coded for this dataset.
 
 ## 2. Show that the data was understood, not just read
 
-**Data Quality** — nine issues on this file. The ones worth stopping on:
+**02 Clean** — nine issues on this file. The ones worth stopping on:
 
 - `returns_present` on Quantity: 10,624 rows. The agent flagged returns as a business
   fact to report rather than an error to clean away.
 - `ambiguous_type` on InvoiceNo and StockCode: the loader refused to cast them to numbers.
   Had it done so, every `C`-prefixed cancellation document would have become null.
 
-**Semantic Model** — eight business roles bound to columns, each with a confidence score
+**03 Model** — eight business roles bound to columns, each with a confidence score
 and the reasoning behind it. `InvoiceNo → order_id` at 0.95, `Country → geo` at 0.90.
 Note that `InvoiceNo` (25,900 distinct) is *not* offered as a chart dimension: it is a key.
 
 ## 3. The KPIs are real business metrics
 
-**KPIs** — 14 computed, each with its formula:
+**04 Measure** — 14 computed, each with its formula:
 
 ```
 Net Revenue   SUM(online_retail.Quantity * online_retail.UnitPrice)          9,747,747.93
@@ -67,11 +67,22 @@ Open any KPI to see its formula, compiled SQL, lineage and XAI explanation.
   **SQL executed** — the exact query behind the chart.
 - Toggle **Table** on any chart for the underlying numbers.
 
+## 4b. Insights carry actions, not just facts
+
+On **05 Analyze**, the header states how many findings are grounded and how many
+carry a recommendation. Open a risk: the recommendation sits beside the evidence
+and names the rule that produced it — for the UK concentration it quantifies the
+exposure ("a 10% fall removes about 816,713") rather than asserting that
+concentration is bad.
+
+Point out that only some findings carry one. The rules have thresholds, so a 4%
+move gets no advice; that is deliberate.
+
 ## 5. Show the agents disagreeing
 
 This is the part that distinguishes a graph from a script.
 
-In **Audit / XAI**, show the verdict and its reasoning, then the per-KPI explanations:
+In **07 Audit**, show the verdict and its reasoning, then the per-KPI explanations:
 what happened, how it was calculated, which roles were bound, what filter was applied, and
 what the quality caveats are.
 
@@ -94,6 +105,11 @@ labelled sums and averages rather than dressing them up as revenue.
 
 ## 7. Evaluation
 
-**Settings → Export** produces JSON, CSV, Excel or PDF. The evaluation report scores each
-agent, including `vs_naive_baseline`: what a non-agentic script gets by summing every
-numeric column, which has no revenue, no average order value and no return rate.
+**Settings → Export** produces JSON, CSV, Excel or PDF, all built from one report so
+they cannot disagree. The Excel workbook has a sheet per deliverable — KPI catalogue,
+Data quality, Transformations, Insights (with recommendations), Evaluation, XAI and the
+semantic model.
+
+The evaluation sheet scores each agent, including `vs_naive_baseline`: what a
+non-agentic script gets by summing every numeric column, which has no revenue, no
+average order value and no return rate at any count.

@@ -45,6 +45,7 @@ from app.analytics.kpi_engine import (
     describe_grammar,
     quote_ident,
 )
+from app.analytics import recommendations
 from app.analytics.roles import SemanticBinding, bind_roles
 from app.analytics.stats import (
     concentration,
@@ -911,6 +912,7 @@ class PipelineExecutor:
                 insights.extend(self._insights_for(kpi, result, trend, anomalies, season, values))
 
             insights.extend(self._structural_insights())
+            insights.extend(self._caveat_insights())
 
             llm = interpret_analyst(
                 {
@@ -1024,6 +1026,26 @@ class PipelineExecutor:
                     grounded=True,
                 )
             )
+            # The direction that matters is the business one, not the sign.
+            recommendations.attach(
+                produced[-1],
+                recommendations.adverse_move(
+                    metric=kpi.name,
+                    change_pct=result.change_pct,
+                    previous=result.previous_value,
+                    current=latest_value,
+                    period=str(comparison_period or "the latest period"),
+                )
+                if favourable is False
+                else recommendations.favourable_move(
+                    metric=kpi.name,
+                    change_pct=result.change_pct,
+                    period=str(comparison_period or "the latest period"),
+                    r2=trend.get("r2"),
+                )
+                if favourable is True
+                else None,
+            )
         else:
             produced.append(
                 Insight(
@@ -1089,6 +1111,57 @@ class PipelineExecutor:
                     grounded=True,
                 )
             )
+            recommendations.attach(
+                produced[-1],
+                recommendations.anomaly(
+                    metric=kpi.name,
+                    period=str(period),
+                    value=top["value"],
+                    method=top["method"],
+                    periods_tested=len(series),
+                ),
+            )
+
+        # A material return rate is an operational risk in its own right, and
+        # deserves its own row rather than being buried in the KPI catalog.
+        if kpi.slug == "order_return_rate" and (result.value or 0) >= 5:
+            returned = (
+                self.db.query(KPIResult)
+                .join(KPI, KPI.id == KPIResult.kpi_id)
+                .filter(KPI.run_id == self.run_id, KPI.slug == "returned_value")
+                .first()
+            )
+            produced.append(
+                Insight(
+                    run_id=self.run_id,
+                    kpi_id=kpi.id,
+                    title=f"{result.value:.1f}% of orders are cancellations",
+                    description=(
+                        f"{kpi.name} is {result.value:.1f}%, computed as {kpi.formula}. "
+                        "Returns are netted out of revenue, so this rate erodes the top line "
+                        "even when gross sales look healthy."
+                    ),
+                    category="risk",
+                    evidence={
+                        "return_rate_pct": result.value,
+                        "returned_value": returned.value if returned else None,
+                        "sql": kpi.query_sql,
+                    },
+                    metric=kpi.name,
+                    value=result.value,
+                    severity="warning",
+                    confidence=0.85,
+                    query_sql=kpi.query_sql,
+                    grounded=True,
+                )
+            )
+            recommendations.attach(
+                produced[-1],
+                recommendations.return_rate(
+                    rate_pct=float(result.value or 0),
+                    returned_value=returned.value if returned else None,
+                ),
+            )
 
         breakdown = result.breakdown or []
         additivity = (result.filters or {}).get("additivity", "additive")
@@ -1120,6 +1193,15 @@ class PipelineExecutor:
                         grounded=True,
                     )
                 )
+                recommendations.attach(
+                    produced[-1],
+                    recommendations.concentration(
+                        segment=str(top["dimension"]),
+                        share=share,
+                        metric=kpi.name,
+                        segment_value=_as_float(top["value"]),
+                    ),
+                )
 
         if season and season.get("peak_period"):
             produced.append(
@@ -1141,6 +1223,45 @@ class PipelineExecutor:
                     confidence=0.7,
                     query_sql=kpi.query_sql,
                     grounded=True,
+                )
+            )
+            recommendations.attach(
+                produced[-1],
+                recommendations.seasonality(
+                    metric=kpi.name,
+                    peak=str(season["peak_period"]),
+                    trough=str(season["trough_period"]),
+                    amplitude_pct=float(season["amplitude_pct"]),
+                ),
+            )
+        return produced
+
+    def _caveat_insights(self) -> list[Insight]:
+        """Turn type-inference and role-binding limits into stated caveats.
+
+        These conditions already gate the auditor's verdict; surfacing them as
+        findings means a reader sees the limits of the numbers next to the
+        numbers, instead of only in the audit record.
+        """
+        produced: list[Insight] = []
+        notes = [note for inference in self.inferences.values() for note in inference.warnings]
+        if self.binding is not None:
+            notes.extend(self.binding.unbound_notes)
+
+        for note in notes[:6]:
+            text, basis = recommendations.data_caveat(issue=note)
+            produced.append(
+                Insight(
+                    run_id=self.run_id,
+                    title=note.split(":")[0].strip()[:120] or "Data quality caveat",
+                    description=note,
+                    category="quality_caveat",
+                    evidence={"source": "schema inference / role binding"},
+                    severity="warning",
+                    confidence=1.0,
+                    grounded=True,
+                    recommendation=text,
+                    recommendation_basis=basis,
                 )
             )
         return produced
@@ -1188,6 +1309,15 @@ class PipelineExecutor:
                             grounded=True,
                         )
                     )
+                    recommendations.attach(
+                        produced[-1],
+                        recommendations.pareto(
+                            dimension=dimension.column,
+                            measure=measure.column,
+                            cutoff=int(result["cutoff_count"]),
+                            total_segments=total_segments,
+                        ),
+                    )
                 focus = concentration(frame, dimension.column)
                 if focus:
                     self.db.add(
@@ -1232,6 +1362,14 @@ class PipelineExecutor:
                             confidence=0.65,
                             grounded=True,
                         )
+                    )
+                    recommendations.attach(
+                        produced[-1],
+                        recommendations.correlation(
+                            left=strongest["left"],
+                            right=strongest["right"],
+                            coefficient=float(strongest["correlation"]),
+                        ),
                     )
         return produced
 
@@ -1915,6 +2053,10 @@ class PipelineExecutor:
 # analysis; the point of the analyst agent is to decide what is worth saying.
 MAX_INSIGHTS = 24
 MAX_INSIGHTS_PER_KPI = 3
+# The same rule firing on four correlated metrics restates one fact four times
+# ("the UK dominates revenue, gross revenue, units and lines"). Keep the
+# strongest couple and drop the echoes.
+MAX_INSIGHTS_PER_RULE = 2
 CATEGORY_WEIGHT = {
     "risk": 1.0,
     "anomaly": 0.9,
@@ -1929,6 +2071,9 @@ SEVERITY_WEIGHT = {"critical": 1.0, "warning": 0.75, "info": 0.4}
 def _insight_score(insight: Insight) -> float:
     score = CATEGORY_WEIGHT.get(insight.category, 0.4) + SEVERITY_WEIGHT.get(insight.severity, 0.4)
     score += float(insight.confidence or 0) * 0.5
+    # A finding that carries an action outranks one that only states a fact.
+    if getattr(insight, "recommendation", None):
+        score += 0.3
     # A 2% move is technically a trend and practically noise.
     comparison = insight.comparison or ""
     match = re.search(r"([-+]?\d+(?:\.\d+)?)%", comparison)
@@ -1946,6 +2091,7 @@ def _rank_insights(insights: list[Insight]) -> list[Insight]:
     ordered = sorted(insights, key=_insight_score, reverse=True)
     kept: list[Insight] = []
     per_kpi: dict[Any, int] = {}
+    per_rule: dict[str, int] = {}
     seen_titles: set[str] = set()
     for insight in ordered:
         title_key = insight.title.lower()
@@ -1954,9 +2100,14 @@ def _rank_insights(insights: list[Insight]) -> list[Insight]:
         key = insight.kpi_id or insight.metric or id(insight)
         if per_kpi.get(key, 0) >= MAX_INSIGHTS_PER_KPI:
             continue
+        basis = getattr(insight, "recommendation_basis", None)
+        if basis and per_rule.get(basis, 0) >= MAX_INSIGHTS_PER_RULE:
+            continue
         kept.append(insight)
         seen_titles.add(title_key)
         per_kpi[key] = per_kpi.get(key, 0) + 1
+        if basis:
+            per_rule[basis] = per_rule.get(basis, 0) + 1
         if len(kept) >= MAX_INSIGHTS:
             break
     return kept

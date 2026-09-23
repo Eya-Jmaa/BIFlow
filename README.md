@@ -133,12 +133,13 @@ Same URLs. Use this when you want the queue and the multi-process event stream.
 3. Open **Datasets**, drop the file in.
 4. Click **Run pipeline** in the header. It takes about 8 seconds on the 541k-row
    UCI file; the Pipeline screen shows each agent as it completes.
-5. Work through Data Quality → Semantic Model → KPIs → Dashboard → Insights → Audit.
+5. Work through the pipeline: 01 Profile → 02 Clean → 03 Model → 04 Measure →
+   05 Analyze → 06 Visualize → 07 Audit. Press ⌘K / Ctrl-K anywhere to jump.
 
 ### Tests
 
 ```bash
-cd backend && pytest -q          # 99 tests
+cd backend && pytest -q          # 127 tests
 cd frontend && npx tsc --noEmit  # type check
 ```
 
@@ -180,7 +181,7 @@ disagreeing, not just the output.
 
 ### What the tests cover
 
-99 tests: date-format resolution and the value-loss guards, the formula grammar and its
+127 tests: date-format resolution and the value-loss guards, the formula grammar and its
 rejection of invented columns and injected SQL, additivity classification, KPI catalog
 reconciliation, partial-period handling, insight ranking, the read-only SQL validator,
 LLM output grounding, agent evaluation metrics, and the agent graph end to end —
@@ -190,6 +191,67 @@ and that re-running an agent does not duplicate its artefacts.
 `tests/test_real_dataset.py` asserts the figures above against the real file and skips
 when it is absent, so a green suite does not by itself prove they still hold — check it
 did not skip.
+
+## The interface
+
+The app is organised around the pipeline: each agent's stage is a screen,
+numbered in execution order, and the sidebar doubles as a map of how far the
+run got. A few things worth calling out:
+
+- **The homepage hero is the product.** The pipeline graph and the engine
+  readout bind to the most recent real project; hovering a stage shows what that
+  agent actually produced on the last run. With no project yet, they render an
+  idle state rather than a staged demo.
+- **Every number opens.** Click a KPI anywhere and the inspector shows its
+  definition, formula, compiled SQL, source tables, historical series, the agent
+  that produced it and the auditor's verdict.
+- **The audit screen traces one number end to end** — run → raw → transform →
+  clean → semantic model → KPI → SQL — from the lineage the backend records.
+- **⌘K / Ctrl-K** opens a command palette built from real state: the projects
+  that exist, the stages of this project, and the KPIs this run computed.
+- **Dark mode is a selected theme**, not an inversion: chart colours are
+  re-stepped for the dark surface and validated against it.
+- **Nothing is mocked.** Where a capability is not implemented — live database
+  connectors, for example — the UI says so plainly instead of faking a screen.
+
+
+## Deliverables
+
+The brief (§10) lists nine. Where each one lives:
+
+| Deliverable | In the app | In the export |
+| --- | --- | --- |
+| Source code and architecture | — | [docs/architecture.md](docs/architecture.md) |
+| Automated BI pipeline | **Pipeline runs** | `run` + `agent_versions` |
+| Dataset and source documentation | **Datasets** | [data/documentation/](data/documentation/uci-online-retail.md) |
+| Data Quality Report | **02 Clean** | `data_quality` · *Data quality* sheet |
+| KPI catalogue and formulas | **04 Measure** | `kpis` · *KPI catalogue* sheet · CSV |
+| Interactive BI dashboard | **06 Visualize** | — (interactive by nature) |
+| Insights and recommendations | **05 Analyze** | `insights` · *Insights* sheet |
+| Evaluation and XAI report | **07 Audit** | `evaluation`, `xai` · both sheets |
+| Multi-agent demonstration | Agent activity drawer | [docs/demo.md](docs/demo.md) |
+
+Every export format is built from one assembled report, so JSON, Excel and PDF
+cannot disagree about a number. CSV is the exception — it is a flat table, so it
+carries the KPI catalogue alone.
+
+### Recommendations
+
+Findings carry an action where one follows from what was measured. Each
+recommendation is produced by a rule in `app/analytics/recommendations.py`,
+quotes the numbers behind it, and records which rule fired — so the advice is
+auditable the same way a KPI is:
+
+> **United Kingdom accounts for 85.1% of Net Revenue**
+> United Kingdom carries 85.1% of Net Revenue. A 10% fall there removes about
+> 816,713 — size that against your plan before treating the total as stable. If
+> this concentration is not deliberate, look at what limits the other segments:
+> coverage, pricing, or supply.
+> *Rule: concentration>=40% of an additive metric*
+
+Not every finding gets one. A rule stays silent below its threshold, because a
+recommendation on every row is indistinguishable from none.
+
 
 ## Configuration
 
@@ -224,7 +286,13 @@ deterministic output.
 
 - Large files are profiled with Polars and DuckDB but still need adequate worker memory
 - Map widgets render only when a geographic dimension and widget data both exist
-- Authentication is modelled (`users` table) but the demo API is open on the local network
+- There is no authentication: the API is open on the local network
+- Recommendations are rule-based, not generated. Each is a template attached to a
+  measured condition, so they are auditable and never hallucinated — but they are
+  general BI practice, not advice specific to your business context
+- Only file upload is implemented; there are no live database or API connectors
+- Join discovery is implemented and tested, but a single-table source leaves it
+  largely unexercised in this project
 - Role binding is heuristic; the Semantic Model screen shows every binding and its
   confidence so a wrong one can be spotted
 - A date column whose ordering cannot be proven is parsed under a stated assumption and

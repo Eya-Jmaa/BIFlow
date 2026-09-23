@@ -5,16 +5,23 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.data.adapters import adapter_for_file
 from app.db.session import get_db
+from app.domains.profiles import get_domain, infer_domain
 from app.models import Dataset, DatasetFile, Project
 from app.schemas.api import DatasetOut, ProjectCreate, ProjectOut
 from app.security.files import safe_join, validate_upload
 
 router = APIRouter()
+
+
+class DomainInferRequest(BaseModel):
+    business_objective: str
+    columns: list[str] = []
 
 
 @router.post("/projects", response_model=ProjectOut)
@@ -115,3 +122,48 @@ async def upload_dataset(
 @router.get("/projects/{project_id}/datasets", response_model=list[DatasetOut])
 def list_datasets(project_id: UUID, db: Session = Depends(get_db)) -> list[Dataset]:
     return db.query(Dataset).filter(Dataset.project_id == project_id).all()
+
+
+class DomainPreview(BaseModel):
+    """What the orchestrator would infer from this objective, right now."""
+
+    domain: str
+    matched_terms: list[str]
+    common_dimensions: list[str]
+    common_metrics: list[str]
+    common_kpis: list[str]
+    rules: list[str]
+    confident: bool
+
+
+@router.post("/domains/infer", response_model=DomainPreview)
+def infer_domain_preview(payload: DomainInferRequest) -> DomainPreview:
+    """Preview domain inference before a project exists.
+
+    This runs the same deterministic `infer_domain` the BI Orchestrator uses at
+    the start of a run, so the preview a user sees while typing their objective
+    is the decision the pipeline will actually make — not an illustration of one.
+    """
+    objective = payload.business_objective or ""
+    columns = payload.columns or []
+    domain = infer_domain(objective, columns)
+    profile = get_domain(domain)
+
+    blob = f"{objective} {' '.join(columns)}".lower()
+    matched = sorted(
+        {
+            term
+            for term in profile.business_terms + profile.common_metrics + profile.common_dimensions
+            if term.lower() in blob
+        }
+    )
+    return DomainPreview(
+        domain=domain,
+        matched_terms=matched,
+        common_dimensions=profile.common_dimensions,
+        common_metrics=profile.common_metrics,
+        common_kpis=profile.common_kpis,
+        rules=profile.rules,
+        # "general" is the fallback when nothing matched, not a positive match.
+        confident=domain != "general" and bool(matched),
+    )

@@ -196,3 +196,35 @@ class TestInsightRanking:
     def test_duplicate_titles_are_collapsed(self):
         pair = [self._insight(title="Same title", metric=f"m{i}") for i in range(2)]
         assert len(_rank_insights(pair)) == 1
+
+
+class TestDtypeHandling:
+    """Polars parametrises some dtypes; identity against a set silently fails.
+
+    ``Datetime(time_unit="us")`` is not ``pl.Datetime``, so a `dtype in {...}`
+    check sent every datetime column down the categorical branch. Date ranges
+    and grain were never computed, and the semantic model's grain was always
+    None as a result.
+    """
+
+    def test_datetime_columns_get_a_range_and_grain(self):
+        frame = pl.DataFrame(
+            {"ordered_at": [dt.datetime(2011, 1, 5), dt.datetime(2011, 6, 5), dt.datetime(2011, 12, 9)]}
+        )
+        column = profile_frame(frame, "t").columns[0]
+        assert column.logical_type == "datetime"
+        assert "min_date" in column.stats and "max_date" in column.stats
+        assert column.stats["granularity"] != "unknown"
+        # The categorical fallback must not have fired.
+        assert "top_values" not in column.stats
+
+    def test_numeric_columns_still_get_quantiles(self):
+        frame = pl.DataFrame({"amount": [1.0, 2.0, 3.0, 4.0, 100.0]})
+        column = profile_frame(frame, "t").columns[0]
+        assert {"q25", "median", "q75", "min", "max"} <= set(column.stats)
+
+    def test_a_date_typed_column_is_temporal_too(self):
+        frame = pl.DataFrame({"day": [dt.date(2011, 1, 5), dt.date(2011, 2, 5)]})
+        column = profile_frame(frame, "t").columns[0]
+        assert column.logical_type == "datetime"
+        assert "min_date" in column.stats

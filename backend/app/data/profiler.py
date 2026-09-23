@@ -43,12 +43,19 @@ class TableProfile(BaseModel):
     pii_flags: list[dict[str, Any]] = Field(default_factory=list)
 
 
-NUMERIC_DTYPES = {
-    pl.Int8, pl.Int16, pl.Int32, pl.Int64,
-    pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
-    pl.Float32, pl.Float64, pl.Decimal,
-}
-TEMPORAL_DTYPES = {pl.Date, pl.Datetime, pl.Time, pl.Duration}
+def _is_numeric(dtype: pl.DataType) -> bool:
+    """Polars parametrises some dtypes, so identity against a set is unsafe.
+
+    ``Datetime(time_unit="us")`` is not the same object as ``pl.Datetime`` and
+    fails a ``dtype in {...}`` test, which previously sent every datetime
+    column down the categorical branch — so no date range or grain was ever
+    computed. The dtype predicates handle the parametrised forms correctly.
+    """
+    return dtype.is_numeric()
+
+
+def _is_temporal(dtype: pl.DataType) -> bool:
+    return dtype.is_temporal()
 
 
 def _safe_float(value: Any) -> float | None:
@@ -65,9 +72,9 @@ def _safe_float(value: Any) -> float | None:
 
 def _logical_type(name: str, dtype: pl.DataType, distinct: int, rows: int, sample: list[str]) -> str:
     lowered = name.lower()
-    if any(h in lowered for h in DATE_HINTS) or dtype in TEMPORAL_DTYPES:
+    if any(h in lowered for h in DATE_HINTS) or _is_temporal(dtype):
         return "datetime"
-    if dtype in NUMERIC_DTYPES:
+    if _is_numeric(dtype):
         if any(h in lowered for h in MONEY_HINTS):
             return "currency"
         if any(h in lowered for h in QTY_HINTS):
@@ -135,7 +142,7 @@ def profile_frame(frame: pl.DataFrame, name: str) -> TableProfile:
         col_warnings: list[str] = []
         stats: dict[str, Any] = {"polars_dtype": str(dtype)}
 
-        if dtype in NUMERIC_DTYPES and non_null.len() > 0:
+        if _is_numeric(dtype) and non_null.len() > 0:
             numeric = non_null.cast(pl.Float64, strict=False)
             desc = numeric.describe()
             desc_map = {row["statistic"]: _safe_float(row["value"]) for row in desc.to_dicts()}
@@ -166,7 +173,7 @@ def profile_frame(frame: pl.DataFrame, name: str) -> TableProfile:
                         col_warnings.append("High outlier rate by IQR")
             if stats.get("min") is not None and stats.get("max") is not None and stats["min"] < 0 and "id" in col.lower():
                 col_warnings.append("Negative values in identifier-like column")
-        elif dtype in TEMPORAL_DTYPES and non_null.len() > 0:
+        elif _is_temporal(dtype) and non_null.len() > 0:
             stats.update(
                 {
                     "min_date": str(non_null.min()),
